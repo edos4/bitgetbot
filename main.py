@@ -1,0 +1,372 @@
+"""
+main.py - Trading Engine Orchestrator
+Entry point for all modes: paper, live, backtest.
+
+Usage:
+    python main.py                  # Use mode from .env / config
+    python main.py --mode paper     # Force paper trading
+    python main.py --mode live      # Force live trading
+    python main.py --mode backtest  # Run backtest on top symbols
+    python main.py --mode backtest --symbol BTCUSDT
+"""
+import os
+import sys
+import signal
+import argparse
+import time
+import threading
+from datetime import datetime
+from typing import Dict, Optional
+
+from config import get_config, reload_config
+from logger import setup_logger, get_logger
+from bitget_rest import BitgetRestClient
+from bitget_ws import BitgetWebSocket
+from universe import UniverseManager
+from data_feed import DataFeed
+from scanner import Scanner
+from risk_manager import RiskManager
+from portfolio_manager import PortfolioManager, Position
+from execution_engine import ExecutionEngine
+from paper_engine import PaperEngine
+from metrics import MetricsTracker, TradeRecord
+from discord_notifier import DiscordNotifier
+from strategy import generate_signal, SignalDirection, compute_trailing_stop
+from regime import detect_regime
+from backtester import Backtester
+
+log = get_logger("main")
+
+# -----------------------------------------------------------------------
+# Graceful shutdown
+# -----------------------------------------------------------------------
+_shutdown_event = threading.Event()
+
+
+def _handle_sigint(signum, frame):
+    log.warning("Shutdown signal received — cleaning up …")
+    _shutdown_event.set()
+
+
+signal.signal(signal.SIGINT, _handle_sigint)
+signal.signal(signal.SIGTERM, _handle_sigint)
+
+
+# -----------------------------------------------------------------------
+# Engine
+# -----------------------------------------------------------------------
+
+class TradingEngine:
+    def __init__(self, mode_override: Optional[str] = None) -> None:
+        cfg = get_config()
+        if mode_override:
+            cfg.trading.mode = mode_override
+
+        self._cfg = cfg
+        self._mode = cfg.trading.mode
+        log.info("=== Bitget Futures Engine | mode=%s ===", self._mode.upper())
+
+        # Shared components
+        self._rest = BitgetRestClient()
+        self._universe = UniverseManager(self._rest)
+        self._feed = DataFeed(self._rest)
+        self._scanner = Scanner(self._feed)
+        self._risk = RiskManager()
+        self._portfolio = PortfolioManager(self._feed, self._risk)
+        self._metrics = MetricsTracker()
+        self._notifier = DiscordNotifier()
+
+        # Mode-specific setup
+        initial_equity = 10_000.0
+        if self._mode == "live":
+            try:
+                acct = self._rest.get_account()
+                initial_equity = float(acct.get("available", initial_equity))
+                log.info("Live account equity: $%.2f", initial_equity)
+            except Exception as e:
+                log.error("Could not fetch live equity: %s", e)
+
+        self._paper = PaperEngine(initial_equity=initial_equity)
+        self._portfolio.set_equity(initial_equity)
+
+        self._executor = ExecutionEngine(
+            portfolio=self._portfolio,
+            risk=self._risk,
+            paper_engine=self._paper if self._mode == "paper" else None,
+            rest_client=self._rest if self._mode == "live" else None,
+        )
+
+        self._ws: Optional[BitgetWebSocket] = None
+        if self._mode == "live":
+            self._ws = BitgetWebSocket(on_price_update=self._on_ws_price)
+
+        self._last_equity: float = initial_equity
+        self._last_scan_time: float = 0.0
+        self._last_correlation_time: float = 0.0
+        self._correlation_interval: int = 600  # seconds
+
+    # ------------------------------------------------------------------ #
+    # Main loop
+    # ------------------------------------------------------------------ #
+
+    def run(self) -> None:
+        if self._mode == "live" and self._ws:
+            self._ws.start()
+
+        # Initial universe discovery
+        self._universe.refresh()
+
+        log.info("Engine running. Press Ctrl+C to stop.")
+
+        while not _shutdown_event.is_set():
+            try:
+                self._cycle()
+            except Exception as e:
+                log.error("Main loop error: %s", e, exc_info=True)
+                self._notifier.error(str(e))
+
+            _shutdown_event.wait(timeout=self._cfg.trading.scan_interval_seconds)
+
+        self._shutdown()
+
+    def _cycle(self) -> None:
+        """One full scan/trade cycle."""
+        now = time.time()
+
+        # Refresh universe periodically
+        if self._universe.needs_refresh():
+            self._universe.refresh()
+
+        # Update equity
+        self._refresh_equity()
+
+        equity = self._portfolio.get_equity()
+        log.info("Cycle start | equity=$%.2f | open_pos=%d | daily_pnl=%.2f",
+                 equity, self._portfolio.count_open(),
+                 self._risk.get_daily_pnl())
+
+        # Correlation matrix
+        if now - self._last_correlation_time > self._correlation_interval:
+            symbols = self._universe.get_universe()[:50]
+            self._portfolio.compute_correlation_blocks(symbols)
+            self._last_correlation_time = now
+
+        # Trailing stop updates
+        self._update_trailing_stops()
+
+        # Exit checks for open positions
+        self._check_exits()
+
+        # Scan for new opportunities
+        universe = self._universe.get_universe()
+        if not universe:
+            log.warning("Empty universe — skipping scan")
+            return
+
+        scores = self._scanner.scan(universe)
+        top_n = scores[:self._cfg.trading.top_n_symbols]
+
+        # Generate and execute signals
+        current_prices = self._get_current_prices()
+
+        for score in top_n:
+            sym = score.symbol
+            # Skip already open
+            if self._portfolio.get_position(sym):
+                continue
+
+            df = self._feed.get_ohlcv(sym)
+            if df is None or df.empty:
+                continue
+
+            signal = generate_signal(sym, df)
+            if signal.direction == SignalDirection.NONE:
+                continue
+
+            placed = self._executor.execute_signal(signal, equity, current_prices)
+            if placed:
+                pos = self._portfolio.get_position(sym)
+                if pos:
+                    self._notifier.trade_opened(
+                        sym, signal.direction.value,
+                        signal.entry_price, signal.stop_loss,
+                        pos.quantity * pos.entry_price / pos.leverage,
+                        signal.regime.value,
+                    )
+
+        # Record equity snapshot
+        self._metrics.record_equity(equity)
+        self._last_scan_time = now
+
+    def _check_exits(self) -> None:
+        """Check all open positions for stop/target hits."""
+        prices = self._get_current_prices()
+        self._portfolio.update_prices(prices)
+
+        for sym, pos in list(self._portfolio.get_all_positions().items()):
+            price = prices.get(sym)
+            if not price:
+                continue
+
+            should_close, reason = self._portfolio.check_stop_and_target(sym, price)
+            if should_close:
+                pnl_before = pos.unrealized_pnl
+                self._executor.close_position(sym, price, reason)
+                self._notifier.trade_closed(
+                    sym, pos.direction.value,
+                    pos.entry_price, price, pnl_before, reason
+                )
+                # Record trade
+                rec = TradeRecord(
+                    trade_id=f"{sym}_{int(time.time())}",
+                    symbol=sym,
+                    direction=pos.direction.value,
+                    entry_price=pos.entry_price,
+                    exit_price=price,
+                    quantity=pos.quantity,
+                    pnl=pnl_before,
+                    pnl_pct=pnl_before / (pos.entry_price * pos.quantity + 1e-10),
+                    fees=pos.entry_price * pos.quantity * self._cfg.trading.taker_fee_pct,
+                    entry_time=pos.entry_time.isoformat(),
+                    exit_time=datetime.utcnow().isoformat(),
+                    duration_seconds=(datetime.utcnow() - pos.entry_time).total_seconds(),
+                    regime=pos.regime,
+                    exit_reason=reason,
+                    stop_loss=pos.stop_loss,
+                    take_profit=pos.take_profit,
+                )
+                self._metrics.record_trade(rec)
+
+    def _update_trailing_stops(self) -> None:
+        """Update trailing stops for all open positions."""
+        prices = self._get_current_prices()
+        for sym, pos in list(self._portfolio.get_all_positions().items()):
+            price = prices.get(sym)
+            if not price or pos.atr == 0:
+                continue
+            new_stop = compute_trailing_stop(
+                pos.direction, price,
+                pos.highest_price if pos.direction == SignalDirection.LONG else pos.lowest_price,
+                pos.atr
+            )
+            # Only move stop in the profitable direction
+            if pos.direction == SignalDirection.LONG and new_stop > pos.stop_loss:
+                self._portfolio.update_stop_loss(sym, new_stop)
+            elif pos.direction == SignalDirection.SHORT and new_stop < pos.stop_loss:
+                self._portfolio.update_stop_loss(sym, new_stop)
+
+    def _refresh_equity(self) -> None:
+        if self._mode == "paper":
+            equity = self._paper.get_equity()
+        else:
+            try:
+                acct = self._rest.get_account()
+                equity = float(acct.get("available", self._last_equity))
+            except Exception:
+                equity = self._last_equity
+
+        self._last_equity = equity
+        self._portfolio.set_equity(equity)
+
+    def _get_current_prices(self) -> Dict[str, float]:
+        if self._ws:
+            return self._ws.get_all_prices()
+        # REST fallback: get last close from cached candles
+        prices = {}
+        for sym in self._universe.get_universe()[:60]:
+            df = self._feed.get_ohlcv(sym)
+            if df is not None and not df.empty:
+                prices[sym] = float(df["close"].iloc[-1])
+        return prices
+
+    def _on_ws_price(self, symbol: str, price: float) -> None:
+        """Called by WebSocket thread on every price update."""
+        pass  # Price cache handled inside ws; exits checked in cycle
+
+    def _shutdown(self) -> None:
+        log.info("Shutting down …")
+        if self._ws:
+            self._ws.stop()
+
+        # Close all positions
+        prices = self._get_current_prices()
+        for sym in list(self._portfolio.get_open_symbols()):
+            price = prices.get(sym, 0)
+            if price:
+                self._executor.close_position(sym, price, "SHUTDOWN")
+
+        # Export analytics
+        os.makedirs("logs", exist_ok=True)
+        self._metrics.export_trade_journal()
+        self._metrics.export_equity_curve()
+        if self._mode == "paper":
+            self._paper.export_equity_curve(self._cfg.trading.equity_curve_export_path)
+
+        self._metrics.print_summary()
+        stats = self._metrics.compute_stats()
+        self._notifier.daily_summary(stats)
+        log.info("Engine stopped cleanly.")
+
+
+# -----------------------------------------------------------------------
+# Backtest entry point
+# -----------------------------------------------------------------------
+
+def run_backtest(symbol: str = "BTCUSDT", candle_limit: int = 1000) -> None:
+    cfg = get_config()
+    rest = BitgetRestClient()
+    log.info("Fetching %d candles for %s backtest …", candle_limit, symbol)
+
+    raw = rest.get_candles(symbol, granularity=cfg.trading.candle_granularity, limit=candle_limit)
+    from data_feed import candles_to_df
+    df = candles_to_df(raw)
+
+    if df.empty:
+        log.error("No data returned for %s", symbol)
+        return
+
+    bt = Backtester(initial_equity=10_000.0)
+    bt.run(df, symbol=symbol)
+    bt.print_results()
+    bt.export_trades()
+
+
+# -----------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Bitget Futures Trading Engine")
+    parser.add_argument(
+        "--mode",
+        choices=["paper", "live", "backtest"],
+        help="Override trading mode (default: from .env)"
+    )
+    parser.add_argument(
+        "--symbol",
+        default="BTCUSDT",
+        help="Symbol for backtest mode (default: BTCUSDT)"
+    )
+    parser.add_argument(
+        "--equity",
+        type=float,
+        default=10_000.0,
+        help="Starting equity for paper/backtest mode (default: 10000)"
+    )
+    args = parser.parse_args()
+
+    cfg = get_config()
+    setup_logger("trading_engine", cfg.log_level, cfg.log_dir)
+
+    mode = args.mode or cfg.trading.mode
+    log.info("Starting engine | mode=%s", mode)
+
+    if mode == "backtest":
+        run_backtest(symbol=args.symbol)
+    else:
+        engine = TradingEngine(mode_override=mode)
+        engine.run()
+
+
+if __name__ == "__main__":
+    main()
