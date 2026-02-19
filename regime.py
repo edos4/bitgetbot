@@ -31,7 +31,10 @@ def detect_regime(df: pd.DataFrame) -> Regime:
     3. Default → RANGING
     """
     cfg = get_config().trading
-    if len(df) < cfg.adx_period + 5:
+    # ADX needs roughly 2x the period for proper calculation
+    min_bars_needed = max(cfg.adx_period * 2, cfg.atr_period) + 10
+    if len(df) < min_bars_needed:
+        log.debug("Not enough bars for regime detection (%d < %d), defaulting to RANGING", len(df), min_bars_needed)
         return Regime.RANGING
 
     try:
@@ -51,16 +54,25 @@ def detect_regime(df: pd.DataFrame) -> Regime:
             log.debug("Regime: HIGH_VOLATILITY (ATR=%.4f, median=%.4f)", current_atr, median_atr)
             return Regime.HIGH_VOLATILITY
 
-        # ADX
+        # ADX - needs more bars than ATR
+        if len(df) < cfg.adx_period * 2 + 5:
+            log.debug("Not enough bars for ADX, defaulting to RANGING")
+            return Regime.RANGING
+            
         adx_indicator = ta.trend.ADXIndicator(
             high=df["high"], low=df["low"], close=df["close"],
             window=cfg.adx_period
         )
         adx_series = adx_indicator.adx().dropna()
         if len(adx_series) == 0:
+            log.debug("ADX series empty, defaulting to RANGING")
             return Regime.RANGING
 
         adx = adx_series.iloc[-1]
+        if np.isnan(adx):
+            log.debug("ADX is NaN, defaulting to RANGING")
+            return Regime.RANGING
+            
         if adx > cfg.adx_trending_threshold:
             log.debug("Regime: TRENDING (ADX=%.2f)", adx)
             return Regime.TRENDING
@@ -75,23 +87,33 @@ def detect_regime(df: pd.DataFrame) -> Regime:
 
 def compute_adx(df: pd.DataFrame, period: int = 14) -> float:
     """Return the latest ADX value."""
+    if len(df) < period * 2 + 5:
+        return 0.0
     try:
         ind = ta.trend.ADXIndicator(
             high=df["high"], low=df["low"], close=df["close"], window=period
         )
         s = ind.adx().dropna()
-        return float(s.iloc[-1]) if len(s) > 0 else 0.0
+        if len(s) > 0:
+            val = float(s.iloc[-1])
+            return val if not np.isnan(val) else 0.0
+        return 0.0
     except Exception:
         return 0.0
 
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
     """Return the latest ATR value."""
+    if len(df) < period + 5:
+        return 0.0
     try:
         ind = ta.volatility.AverageTrueRange(
             high=df["high"], low=df["low"], close=df["close"], window=period
         )
         s = ind.average_true_range().dropna()
-        return float(s.iloc[-1]) if len(s) > 0 else 0.0
+        if len(s) > 0:
+            val = float(s.iloc[-1])
+            return val if not np.isnan(val) else 0.0
+        return 0.0
     except Exception:
         return 0.0

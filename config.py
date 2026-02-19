@@ -18,6 +18,9 @@ class APIConfig:
     base_url: str = "https://api.bitget.com"
     ws_url: str = "wss://ws.bitget.com/v2/ws/public"
     ws_private_url: str = "wss://ws.bitget.com/v2/ws/private"
+    # WARNING: Only disable SSL verification for development if you have SSL inspection/proxy issues
+    # Never use this in production with real funds
+    disable_ssl_verification: bool = field(default_factory=lambda: os.getenv("DISABLE_SSL_VERIFICATION", "false").lower() == "true")
 
 
 @dataclass

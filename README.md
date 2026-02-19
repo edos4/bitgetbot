@@ -39,7 +39,7 @@ bitget_engine/
 
 ```bash
 cd bitget_engine
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
@@ -256,6 +256,48 @@ logs/trade_journal.csv      # Trade records
 logs/equity_curve.csv       # Equity snapshots
 logs/backtest_trades.csv    # Backtest trade log
 ```
+
+---
+
+## Troubleshooting
+
+### SSL Certificate / Network Blocking Issues
+
+If you see errors like `CERTIFICATE_VERIFY_FAILED` or `Prohibited Access`:
+
+**Diagnosis:**
+```bash
+# Check if your network is blocking Bitget's API
+curl -I https://api.bitget.com/api/v2/public/time
+```
+
+If it returns HTML or "Prohibited Access", your network is blocking cryptocurrency APIs.
+
+**Solutions:**
+
+1. **Use a VPN (Recommended)**
+   ```bash
+   # If you have OpenVPN
+   sudo openvpn --config your-vpn-config.ovpn
+   
+   # Or install and use ProtonVPN (free tier available)
+   sudo apt install protonvpn
+   protonvpn connect
+   ```
+
+2. **Whitelist api.bitget.com in your router/firewall settings**
+   - Check your router admin panel (usually 192.168.1.1)
+   - Look for "Parental Controls" or "Content Filtering"
+   - Add api.bitget.com to the whitelist
+
+3. **For development/testing ONLY** (not recommended for live trading):
+   ```bash
+   # Add to your .env file
+   DISABLE_SSL_VERIFICATION=true
+   ```
+   ⚠️ This bypasses SSL security checks. Use only for paper trading/backtesting.
+
+4. **Use mobile hotspot** as a temporary workaround
 
 ---
 

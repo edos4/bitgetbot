@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import certifi
 
 from config import get_config
 from logger import get_logger
@@ -46,6 +47,17 @@ class BitgetRestClient:
         self._session = requests.Session()
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
+        
+        # Configure SSL verification
+        if cfg.api.disable_ssl_verification:
+            log.warning("⚠️  SSL VERIFICATION DISABLED - Use only for development with SSL inspection issues")
+            self._session.verify = False
+            # Suppress urllib3 warnings about unverified HTTPS
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        else:
+            # Use certifi's CA bundle for SSL verification
+            self._session.verify = certifi.where()
 
     def _headers(self, method: str, path: str, body: str = "") -> Dict[str, str]:
         ts = _ts()
@@ -70,7 +82,16 @@ class BitgetRestClient:
         headers = self._headers("GET", full_path) if signed else {"Content-Type": "application/json"}
         resp = self._session.get(url, headers=headers, params=params, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
+        
+        # Add better error handling for non-JSON responses (e.g., blocking pages)
+        try:
+            data = resp.json()
+        except Exception as e:
+            log.error(f"Failed to parse JSON response from {url}")
+            log.error(f"Response status: {resp.status_code}")
+            log.error(f"Response content (first 500 chars): {resp.text[:500]}")
+            raise RuntimeError(f"Invalid JSON response from API - possible network filtering/blocking") from e
+            
         if data.get("code") not in ("00000", 0, "0"):
             raise RuntimeError(f"Bitget API error: {data.get('code')} - {data.get('msg')}")
         return data
