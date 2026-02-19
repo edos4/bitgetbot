@@ -15,7 +15,7 @@ import signal
 import argparse
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional
 
 from config import get_config, reload_config
@@ -32,7 +32,6 @@ from paper_engine import PaperEngine
 from metrics import MetricsTracker, TradeRecord
 from discord_notifier import DiscordNotifier
 from strategy import generate_signal, SignalDirection, compute_trailing_stop
-from regime import detect_regime
 from backtester import Backtester
 
 log = get_logger("main")
@@ -168,31 +167,96 @@ class TradingEngine:
 
         # Generate and execute signals
         current_prices = self._get_current_prices()
+        trace_enabled = self._cfg.trading.log_decision_trace
+
+        signals_evaluated = 0
+        signals_generated = 0
+        trades_placed = 0
 
         for score in top_n:
             sym = score.symbol
             # Skip already open
             if self._portfolio.get_position(sym):
+                if trace_enabled:
+                    log.info("TRACE %s: skip (position already open)", sym)
+                else:
+                    log.debug("%s: position already open, skipping", sym)
                 continue
 
             df = self._feed.get_ohlcv(sym)
             if df is None or df.empty:
+                if trace_enabled:
+                    log.info("TRACE %s: skip (no OHLCV data)", sym)
+                else:
+                    log.debug("%s: no OHLCV data available", sym)
                 continue
 
-            signal = generate_signal(sym, df)
+            signals_evaluated += 1
+            signal = generate_signal(sym, df, score.score)
             if signal.direction == SignalDirection.NONE:
+                if trace_enabled:
+                    log.info(
+                        "TRACE %s: no signal | strat=%s | conf=%.2f | regime=%s | reason=%s",
+                        sym,
+                        signal.strategy,
+                        signal.confidence,
+                        signal.regime.value,
+                        signal.reason,
+                    )
+                else:
+                    log.debug("%s: no signal (regime=%s)", sym, signal.regime.value)
                 continue
+
+            # Signal detected!
+            signals_generated += 1
+            log.info(
+                "🎯 %s signal: %s | entry=%.4f stop=%.4f | regime=%s | strat=%s | conf=%.2f",
+                signal.direction.value,
+                sym,
+                signal.entry_price,
+                signal.stop_loss,
+                signal.regime.value,
+                signal.strategy,
+                signal.confidence,
+            )
 
             placed = self._executor.execute_signal(signal, equity, current_prices)
             if placed:
+                trades_placed += 1
                 pos = self._portfolio.get_position(sym)
                 if pos:
-                    self._notifier.trade_opened(
-                        sym, signal.direction.value,
-                        signal.entry_price, signal.stop_loss,
+                    unrealized = pos.unrealized_pnl
+                    position_cost = pos.entry_price * pos.quantity + 1e-10
+                    pnl_pct = (unrealized / position_cost) * 100
+                    log.info(
+                        "🆕 Trade opened: %s %s @ %.4f | size=$%.2f | stop=%.4f | PnL $%.2f (%.2f%%)",
+                        signal.direction.value,
+                        sym,
+                        signal.entry_price,
                         pos.quantity * pos.entry_price / pos.leverage,
-                        signal.regime.value,
+                        signal.stop_loss,
+                        unrealized,
+                        pnl_pct,
                     )
+                    self._notifier.trade_opened(
+                        symbol=sym,
+                        direction=signal.direction.value,
+                        entry=signal.entry_price,
+                        stop=signal.stop_loss,
+                        size_usd=pos.quantity * pos.entry_price / pos.leverage,
+                        regime=signal.regime.value,
+                        pnl=unrealized,
+                        pnl_pct=pnl_pct,
+                        strategy=signal.strategy,
+                        confidence=signal.confidence,
+                    )
+            elif trace_enabled:
+                log.info("TRACE %s: signal not executed (see risk/execution logs)", sym)
+        
+        # Log scan summary
+        if signals_evaluated > 0:
+            log.info("Scan complete: evaluated %d symbols | signals: %d | trades placed: %d", 
+                     signals_evaluated, signals_generated, trades_placed)
 
         # Record equity snapshot
         self._metrics.record_equity(equity)
@@ -211,12 +275,18 @@ class TradingEngine:
             should_close, reason = self._portfolio.check_stop_and_target(sym, price)
             if should_close:
                 pnl_before = pos.unrealized_pnl
+                pnl_pct = (pnl_before / (pos.entry_price * pos.quantity)) * 100 if pos.quantity > 0 else 0
+                
+                log.info("🔔 Closing %s %s @ %.4f | PnL: $%.2f (%.2f%%) | reason: %s", 
+                         pos.direction.value, sym, price, pnl_before, pnl_pct, reason)
+                
                 self._executor.close_position(sym, price, reason)
                 self._notifier.trade_closed(
                     sym, pos.direction.value,
-                    pos.entry_price, price, pnl_before, reason
+                    pos.entry_price, price, pnl_before, pnl_pct, reason
                 )
                 # Record trade
+                exit_ts = datetime.now(timezone.utc)
                 rec = TradeRecord(
                     trade_id=f"{sym}_{int(time.time())}",
                     symbol=sym,
@@ -228,12 +298,15 @@ class TradingEngine:
                     pnl_pct=pnl_before / (pos.entry_price * pos.quantity + 1e-10),
                     fees=pos.entry_price * pos.quantity * self._cfg.trading.taker_fee_pct,
                     entry_time=pos.entry_time.isoformat(),
-                    exit_time=datetime.utcnow().isoformat(),
-                    duration_seconds=(datetime.utcnow() - pos.entry_time).total_seconds(),
+                    exit_time=exit_ts.isoformat(),
+                    duration_seconds=(exit_ts - pos.entry_time).total_seconds(),
                     regime=pos.regime,
                     exit_reason=reason,
                     stop_loss=pos.stop_loss,
                     take_profit=pos.take_profit,
+                    strategy=pos.strategy,
+                    confidence=pos.signal_confidence,
+                    kelly_fraction=pos.kelly_fraction,
                 )
                 self._metrics.record_trade(rec)
 

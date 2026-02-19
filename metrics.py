@@ -36,6 +36,9 @@ class TradeRecord:
     exit_reason: str
     stop_loss: float
     take_profit: Optional[float]
+    strategy: str
+    confidence: float
+    kelly_fraction: float
 
 
 class MetricsTracker:

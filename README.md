@@ -62,19 +62,19 @@ DISCORD_WEBHOOK_URL=            # Optional
 ### 3. Run paper trading (safe default)
 
 ```bash
-python main.py --mode paper
+python3 main.py --mode paper
 ```
 
 ### 4. Run a backtest first
 
 ```bash
-python main.py --mode backtest --symbol BTCUSDT
+python3 main.py --mode backtest --symbol BTCUSDT
 ```
 
 ### 5. Go live (only after testing)
 
 ```bash
-python main.py --mode live
+python3 main.py --mode live
 ```
 
 ---
@@ -83,11 +83,11 @@ python main.py --mode live
 
 | Mode | Command | Description |
 |------|---------|-------------|
-| Paper | `python main.py --mode paper` | Simulated fills, no real money |
-| Live | `python main.py --mode live` | Real Bitget API, real money |
-| Backtest | `python main.py --mode backtest` | Historical replay |
+| Paper | `python3 main.py --mode paper` | Simulated fills, no real money |
+| Live | `python3 main.py --mode live` | Real Bitget API, real money |
+| Backtest | `python3 main.py --mode backtest` | Historical replay |
 
-Or set `TRADING_MODE=paper` / `live` in `.env` and just run `python main.py`.
+Or set `TRADING_MODE=paper` / `live` in `.env` and just run `python3 main.py`.
 
 ---
 
@@ -115,7 +115,7 @@ For a $10,000 account:
 
 ### Step 1 — Paper trade for at least 2 weeks
 ```bash
-python main.py --mode paper
+python3 main.py --mode paper
 ```
 Watch the `logs/` folder for:
 - `trading_engine.log` — full activity log
@@ -298,6 +298,18 @@ If it returns HTML or "Prohibited Access", your network is blocking cryptocurren
    ⚠️ This bypasses SSL security checks. Use only for paper trading/backtesting.
 
 4. **Use mobile hotspot** as a temporary workaround
+
+### Verbose decision logging
+
+If you need to understand why signals are skipped, enable trace logging:
+
+```bash
+export LOG_DECISION_TRACE=true
+python3 main.py --mode paper
+```
+
+The engine will print `TRACE …` lines for every symbol each cycle, showing whether
+data was missing, no setup was found, or a signal was blocked by risk checks.
 
 ---
 

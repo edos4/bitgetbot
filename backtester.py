@@ -19,7 +19,6 @@ import uuid
 
 from config import get_config
 from strategy import generate_signal, SignalDirection, compute_trailing_stop
-from regime import detect_regime
 from metrics import MetricsTracker, TradeRecord
 from logger import get_logger
 

@@ -60,12 +60,29 @@ class TradingConfig:
     bb_std: float = 2.0
     momentum_period: int = 10
     volume_spike_multiplier: float = 1.5      # Volume must be N× avg to confirm signal
+    ema_price_buffer_pct: float = 0.001       # Allow EMA entries within 0.1% of slow EMA
+    bb_touch_buffer_pct: float = 0.001        # Allow BB touches within 0.1% of the band
+    log_decision_trace: bool = field(default_factory=lambda: os.getenv("LOG_DECISION_TRACE", "false").lower() == "true")
+    mean_reversion_z_entry: float = 1.25      # Entry when |z-score| exceeds this value
+    mean_reversion_z_exit: float = 0.25       # Exit bias when price reverts near mid band
+    trend_breakout_z: float = 0.65            # Minimum z-score for breakout confirmation
+    atr_stop_trend_multiplier: float = 1.8    # ATR multiplier for trend stops
+    atr_stop_range_multiplier: float = 1.2    # ATR multiplier for range stops
+    atr_target_trend_multiplier: float = 2.5  # Trend targets aim for >2R
+    atr_target_range_multiplier: float = 0.8  # Range targets capture partial mean reversion
+    signal_confidence_alpha: float = 0.35     # Weight for scanner score inside confidence blend
 
     # ---- Regime Detection ----
     adx_period: int = 14
     adx_trending_threshold: float = 25.0
     atr_volatility_multiplier: float = 2.0    # ATR > N× median → HIGH_VOL
     high_vol_size_reduction: float = 0.50     # Reduce size by 50% in HIGH_VOL
+    regime_trend_threshold: float = 0.6       # Trend score above → TRENDING
+    regime_range_threshold: float = 0.4       # Trend score below → RANGING
+    volatility_short_window: int = 20
+    volatility_long_window: int = 60
+    vol_expansion_ratio: float = 1.15
+    vol_contraction_ratio: float = 0.9
 
     # ---- Analytics ----
     sharpe_risk_free_rate: float = 0.04       # Annual risk-free rate
@@ -78,6 +95,12 @@ class TradingConfig:
     # ---- OHLCV fetch ----
     candle_limit: int = 200                   # Number of candles to fetch per symbol
     candle_granularity: str = "15m"          # Candle interval
+
+    # ---- Portfolio / Allocation ----
+    kelly_fraction_cap: float = 0.65          # Max fractional Kelly allocation
+    kelly_fraction_floor: float = 0.25        # Minimum allocation per approved trade
+    max_trades_per_hour: int = 8              # Hard cap for trade frequency
+    portfolio_variance_cap: float = 0.08      # Variance ceiling for position weights
 
 
 @dataclass

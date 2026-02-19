@@ -6,8 +6,8 @@ Handles retries, partial fills, and stop order placement.
 """
 import time
 import threading
-import uuid
-from typing import Optional, Tuple
+from collections import deque
+from typing import Optional
 
 from config import get_config
 from strategy import Signal, SignalDirection
@@ -39,6 +39,7 @@ class ExecutionEngine:
         self._rest = rest_client
         self._mode = self._cfg.mode
         self._lock = threading.Lock()
+        self._recent_trades = deque()
         log.info("ExecutionEngine initialized in %s mode", self._mode.upper())
 
     # ------------------------------------------------------------------ #
@@ -63,6 +64,10 @@ class ExecutionEngine:
             log.debug("Skip %s — position already open", signal.symbol)
             return False
 
+        if not self._can_trade_now():
+            log.info("❌ Trade blocked [%s]: trade frequency cap hit", signal.symbol)
+            return False
+
         # Stop distance as a fraction of price
         stop_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price
         if stop_pct < 0.001:
@@ -81,13 +86,35 @@ class ExecutionEngine:
         )
 
         if not decision.approved:
-            log.info("Trade blocked [%s]: %s", signal.symbol, decision.reason)
+            log.info("❌ Trade blocked [%s]: %s", signal.symbol, decision.reason)
             return False
 
-        # Apply size multiplier (HIGH_VOL reduction)
-        position_usd = decision.position_size_usd * signal.size_multiplier
+        base_position = decision.position_size_usd * signal.size_multiplier
+        kelly_scale = max(
+            self._cfg.kelly_fraction_floor,
+            min(signal.kelly_fraction or 0.0, self._cfg.kelly_fraction_cap),
+        )
+        position_usd = base_position * kelly_scale
+        if position_usd <= 0:
+            log.info("❌ Trade blocked [%s]: zero position after Kelly scaling", signal.symbol)
+            return False
+
+        if self._portfolio.breaches_variance_cap(position_usd, signal.entry_price, signal.atr):
+            log.info("❌ Trade blocked [%s]: portfolio variance cap exceeded", signal.symbol)
+            return False
+        
+        log.info(
+            "✓ Risk approved [%s]: size=$%.2f leverage=%dx | kelly=%.2f | strat=%s",
+            signal.symbol,
+            position_usd,
+            decision.leverage,
+            kelly_scale,
+            signal.strategy,
+        )
 
         success = self._place_order(signal, position_usd, decision.leverage)
+        if success:
+            self._recent_trades.append(time.time())
         return success
 
     def close_position(
@@ -156,6 +183,9 @@ class ExecutionEngine:
             atr=signal.atr,
             leverage=leverage,
             regime=signal.regime.value,
+            strategy=signal.strategy,
+            signal_confidence=signal.confidence,
+            kelly_fraction=signal.kelly_fraction,
         )
         self._portfolio.open_position(pos)
         return True
@@ -210,6 +240,9 @@ class ExecutionEngine:
                     atr=signal.atr,
                     leverage=leverage,
                     regime=signal.regime.value,
+                    strategy=signal.strategy,
+                    signal_confidence=signal.confidence,
+                    kelly_fraction=signal.kelly_fraction,
                 )
                 self._portfolio.open_position(pos)
 
@@ -252,3 +285,11 @@ class ExecutionEngine:
             except Exception as e:
                 log.error("Close attempt %d failed for %s: %s", attempt + 1, pos.symbol, e)
                 time.sleep(self._cfg.order_retry_delay_seconds)
+
+    def _can_trade_now(self) -> bool:
+        window_seconds = 3600
+        limit = self._cfg.max_trades_per_hour
+        now = time.time()
+        while self._recent_trades and now - self._recent_trades[0] > window_seconds:
+            self._recent_trades.popleft()
+        return len(self._recent_trades) < limit

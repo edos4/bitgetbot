@@ -5,7 +5,7 @@ Non-blocking (runs in background thread). Fails silently if webhook is not confi
 """
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict
 
 from config import get_config
@@ -41,7 +41,7 @@ class DiscordNotifier:
             "title": title,
             "description": description,
             "color": color,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "footer": {"text": "Bitget Trading Engine"},
         }
         if fields:
@@ -60,6 +60,10 @@ class DiscordNotifier:
         stop: float,
         size_usd: float,
         regime: str,
+        pnl: float = 0.0,
+        pnl_pct: float = 0.0,
+        strategy: str = "",
+        confidence: float = 0.0,
     ) -> None:
         if not self._cfg_n.notify_on_trade:
             return
@@ -72,7 +76,10 @@ class DiscordNotifier:
             fields=[
                 {"name": "Stop Loss", "value": f"`{stop:.4f}`", "inline": True},
                 {"name": "Size", "value": f"`${size_usd:.2f}`", "inline": True},
+                {"name": "PnL", "value": f"`${pnl:+.2f}` ({pnl_pct:+.2f}%)", "inline": True},
                 {"name": "Regime", "value": f"`{regime}`", "inline": True},
+                {"name": "Strategy", "value": f"`{strategy or 'NA'}`", "inline": True},
+                {"name": "Confidence", "value": f"`{confidence:.2f}`", "inline": True},
             ],
         ))
 
@@ -83,6 +90,7 @@ class DiscordNotifier:
         entry: float,
         exit_price: float,
         pnl: float,
+        pnl_pct: float,
         reason: str,
     ) -> None:
         if not self._cfg_n.notify_on_trade:
@@ -94,7 +102,7 @@ class DiscordNotifier:
             description=f"**{direction}** | Entry `{entry:.4f}` → Exit `{exit_price:.4f}`",
             color=color,
             fields=[
-                {"name": "PnL", "value": f"`${pnl:+.2f}`", "inline": True},
+                {"name": "PnL", "value": f"`${pnl:+.2f}` ({pnl_pct:+.2f}%)", "inline": True},
                 {"name": "Reason", "value": f"`{reason}`", "inline": True},
             ],
         ))

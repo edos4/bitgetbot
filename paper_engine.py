@@ -7,7 +7,7 @@ import time
 import uuid
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
@@ -27,7 +27,7 @@ class PaperFill:
     quantity: float
     fill_price: float
     fee_paid: float
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class PaperEngine:
@@ -45,7 +45,7 @@ class PaperEngine:
         self._initial_equity = initial_equity
         self._fills: List[PaperFill] = []
         self._equity_curve: List[Dict] = [
-            {"ts": datetime.utcnow().isoformat(), "equity": initial_equity}
+            {"ts": datetime.now(timezone.utc).isoformat(), "equity": initial_equity}
         ]
 
     # ------------------------------------------------------------------ #
@@ -106,7 +106,7 @@ class PaperEngine:
         with self._lock:
             self._equity += pnl - fees
             self._equity_curve.append({
-                "ts": datetime.utcnow().isoformat(),
+                "ts": datetime.now(timezone.utc).isoformat(),
                 "equity": self._equity,
             })
 

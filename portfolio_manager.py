@@ -5,9 +5,8 @@ and identifies correlated pairs that should not both be held.
 """
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Tuple
-import numpy as np
 import pandas as pd
 
 from config import get_config
@@ -25,13 +24,16 @@ class Position:
     quantity: float          # contracts / base units
     stop_loss: float
     take_profit: Optional[float]
-    entry_time: datetime = field(default_factory=datetime.utcnow)
+    entry_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     highest_price: float = 0.0   # for trailing stop (LONG)
     lowest_price: float = float("inf")   # for trailing stop (SHORT)
     unrealized_pnl: float = 0.0
     atr: float = 0.0
     leverage: int = 3
     regime: str = "TRENDING"
+    strategy: str = "UNKNOWN"
+    signal_confidence: float = 0.0
+    kelly_fraction: float = 0.0
 
     def update_price(self, current_price: float) -> None:
         if self.direction == SignalDirection.LONG:
@@ -205,3 +207,39 @@ class PortfolioManager:
     def get_total_unrealized_pnl(self) -> float:
         with self._lock:
             return sum(p.unrealized_pnl for p in self._positions.values())
+
+    # ------------------------------------------------------------------ #
+    # Portfolio variance guard
+    # ------------------------------------------------------------------ #
+
+    def breaches_variance_cap(self, position_usd: float, entry_price: float, atr: float) -> bool:
+        equity = max(self._equity, 1.0)
+        new_weight = position_usd / (equity + 1e-10)
+        new_vol = self._vol_ratio(atr, entry_price)
+
+        with self._lock:
+            weights = [
+                (pos.entry_price * pos.quantity) / (equity + 1e-10)
+                for pos in self._positions.values()
+            ]
+            vols = [self._vol_ratio(pos.atr, pos.entry_price) for pos in self._positions.values()]
+
+        weights.append(new_weight)
+        vols.append(new_vol)
+
+        variance = sum((w * v) ** 2 for w, v in zip(weights, vols))
+        exceeds = variance > self._cfg.portfolio_variance_cap
+        if exceeds:
+            log.info(
+                "Variance cap hit: var=%.4f cap=%.4f | weights=%s",
+                variance,
+                self._cfg.portfolio_variance_cap,
+                [round(w, 3) for w in weights],
+            )
+        return exceeds
+
+    @staticmethod
+    def _vol_ratio(atr: float, price: float) -> float:
+        price = max(price, 1e-8)
+        atr = atr if atr and atr > 0 else price * 0.01
+        return atr / price
