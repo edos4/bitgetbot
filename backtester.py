@@ -18,7 +18,7 @@ import numpy as np
 import uuid
 
 from config import get_config
-from strategy import generate_signal, SignalDirection, compute_trailing_stop
+from strategy import generate_signal, generate_signal_from_cache, IndicatorCache, SignalDirection, compute_trailing_stop
 from metrics import MetricsTracker, TradeRecord
 from logger import get_logger
 
@@ -48,6 +48,10 @@ class BacktestState:
     stop_loss: float = 0.0
     take_profit: float = 0.0
     trailing_stop: float = 0.0
+    atr: float = 0.0
+    entry_price: float = 0.0
+    stop_distance: float = 0.0
+    partial_done: bool = False
 
 
 class Backtester:
@@ -67,47 +71,97 @@ class Backtester:
         Requires at minimum columns: open, high, low, close, volume.
         """
         log.info("Starting backtest: %s | %d bars", symbol, len(df))
-        warmup = max(self._cfg.ema_slow, self._cfg.bb_period, self._cfg.atr_period) + 5
+        warmup = max(self._cfg.ema_slow, self._cfg.bb_period, self._cfg.atr_period,
+                     self._cfg.volatility_long_window) + 5
         state = BacktestState()
+        current_day: Optional[str] = None  # tracks calendar day for daily resets
+
+        # Precompute all indicators once on the full dataframe.
+        # Allow injecting a pre-built cache (e.g. for parameter sweeps).
+        if hasattr(self, '_prebuilt_cache') and self._prebuilt_cache is not None:
+            cache = self._prebuilt_cache
+        else:
+            log.info("Precomputing indicators on %d bars...", len(df))
+            import time as _time
+            t0 = _time.time()
+            cache = IndicatorCache.from_df(df)
+            log.info("Indicators precomputed in %.2fs", _time.time() - t0)
 
         for i in range(warmup, len(df)):
-            window = df.iloc[:i].copy()
             current_bar = df.iloc[i]
             price = float(current_bar["close"])
             high = float(current_bar["high"])
             low = float(current_bar["low"])
 
+            # ---- Daily risk-limit reset ----
+            bar_day = str(df.index[i])[:10]  # "YYYY-MM-DD"
+            if bar_day != current_day:
+                current_day = bar_day
+                self._consecutive_losses = 0
+                self._daily_start_equity = self._equity
+
             # ---- Manage open trade ----
             if state.open_trade:
                 trade = state.open_trade
-                # Update extremes for trailing stop
-                if trade.direction == "LONG":
-                    state.highest_price = max(state.highest_price, high)
-                    trail_stop = compute_trailing_stop(
-                        SignalDirection.LONG, price, state.highest_price,
-                        window["close"].iloc[-1] * 0.01  # rough ATR
-                    )
-                    state.trailing_stop = max(state.trailing_stop, trail_stop) if state.trailing_stop else trail_stop
 
-                    # Check stops
-                    if low <= state.stop_loss or low <= state.trailing_stop:
-                        exit_price = min(state.stop_loss, price)
-                        self._close_trade(trade, i, exit_price, "STOP_LOSS", state)
+                # ---- Partial exit: lock profit at partial_exit_r × stop_distance ----
+                if not state.partial_done and state.stop_distance > 0 and self._cfg.partial_exit_fraction > 0:
+                    pe_threshold = state.stop_distance * self._cfg.partial_exit_r
+                    triggered = (
+                        (trade.direction == "LONG" and high >= state.entry_price + pe_threshold) or
+                        (trade.direction == "SHORT" and low <= state.entry_price - pe_threshold)
+                    )
+                    if triggered:
+                        partial_qty = trade.quantity * self._cfg.partial_exit_fraction
+                        partial_exit_price = (
+                            state.entry_price + pe_threshold if trade.direction == "LONG"
+                            else state.entry_price - pe_threshold
+                        )
+                        if trade.direction == "LONG":
+                            partial_pnl = (partial_exit_price - trade.entry_price) * partial_qty
+                        else:
+                            partial_pnl = (trade.entry_price - partial_exit_price) * partial_qty
+                        partial_fee = partial_exit_price * partial_qty * self._cfg.taker_fee_pct
+                        partial_pnl -= partial_fee
+                        self._equity += partial_pnl
+                        self._equity_curve.append(self._equity)
+                        partial_record = BacktestTrade(
+                            symbol=trade.symbol,
+                            direction=trade.direction,
+                            entry_price=trade.entry_price,
+                            entry_bar=trade.entry_bar,
+                            exit_price=partial_exit_price,
+                            exit_bar=i,
+                            quantity=partial_qty,
+                            pnl=partial_pnl,
+                            fees=partial_fee,
+                            exit_reason="PARTIAL_EXIT",
+                            regime=trade.regime,
+                        )
+                        self._trades.append(partial_record)
+                        trade.quantity -= partial_qty
+                        # Move stop to lock in partial profit minus 1 ATR buffer
+                        # prevents full retracement from erasing gains
+                        if trade.direction == "LONG":
+                            new_stop = state.entry_price + pe_threshold - state.stop_distance
+                            state.stop_loss = max(state.stop_loss, new_stop)
+                        else:
+                            new_stop = state.entry_price - pe_threshold + state.stop_distance
+                            state.stop_loss = min(state.stop_loss, new_stop)
+                        state.partial_done = True
+                        log.debug("BT partial exit %s @ %.4f | pnl=%.2f | new_stop=%.4f", trade.symbol, partial_exit_price, partial_pnl, state.stop_loss)
+
+                # ---- Fixed stop-loss and take-profit checks ----
+                if trade.direction == "LONG":
+                    if low <= state.stop_loss:
+                        self._close_trade(trade, i, state.stop_loss, "STOP_LOSS", state)
                         continue
                     if state.take_profit and high >= state.take_profit:
                         self._close_trade(trade, i, state.take_profit, "TAKE_PROFIT", state)
                         continue
                 else:  # SHORT
-                    state.lowest_price = min(state.lowest_price, low)
-                    trail_stop = compute_trailing_stop(
-                        SignalDirection.SHORT, price, state.lowest_price,
-                        window["close"].iloc[-1] * 0.01
-                    )
-                    state.trailing_stop = min(state.trailing_stop, trail_stop) if state.trailing_stop else trail_stop
-
-                    if high >= state.stop_loss or high >= state.trailing_stop:
-                        exit_price = max(state.stop_loss, price)
-                        self._close_trade(trade, i, exit_price, "STOP_LOSS", state)
+                    if high >= state.stop_loss:
+                        self._close_trade(trade, i, state.stop_loss, "STOP_LOSS", state)
                         continue
                     if state.take_profit and low <= state.take_profit:
                         self._close_trade(trade, i, state.take_profit, "TAKE_PROFIT", state)
@@ -115,14 +169,13 @@ class Backtester:
 
             # ---- Look for entry ----
             if state.open_trade is None:
-                # Risk checks
                 if self._consecutive_losses >= self._cfg.max_consecutive_losses:
                     continue
                 daily_loss = (self._equity - self._daily_start_equity) / self._daily_start_equity
                 if daily_loss <= -self._cfg.max_daily_loss_pct:
                     continue
 
-                signal = generate_signal(symbol, window)
+                signal = generate_signal_from_cache(symbol, cache, i)
                 if signal.direction == SignalDirection.NONE:
                     continue
 
@@ -130,8 +183,24 @@ class Backtester:
                 if stop_pct <= 0:
                     continue
 
+                # Base position USD from risk-per-trade
                 pos_usd = (self._equity * self._cfg.risk_per_trade_pct) / stop_pct
-                pos_usd = min(pos_usd, self._equity * 0.20) * signal.size_multiplier
+                pos_usd = min(pos_usd, self._equity * 0.20)
+
+                # Apply tiered volume-ratio sizing (mirrors execution_engine logic)
+                vol_ratio = signal.volume_ratio
+                if vol_ratio < self._cfg.volume_ratio_min:
+                    continue   # below hard floor — skip (should never reach here but safety guard)
+                elif vol_ratio < self._cfg.volume_ratio_half:
+                    pos_usd *= 0.50    # weak volume → half size
+                elif vol_ratio > self._cfg.volume_ratio_boost:
+                    pos_usd *= 1.25    # strong volume → boost size
+                # else 1.0–1.5 → full size (no adjustment)
+
+                # Scale position by signal confidence (floor 0.25)
+                if signal.confidence < 1.0:
+                    pos_usd *= max(signal.confidence, 0.25)
+
                 qty = (pos_usd * self._cfg.default_leverage) / signal.entry_price
 
                 entry_fee = signal.entry_price * qty * self._cfg.taker_fee_pct
@@ -144,13 +213,18 @@ class Backtester:
                     entry_bar=i,
                     quantity=qty,
                     regime=signal.regime.value,
+                    fees=entry_fee,          # start with entry fee; exit fees accumulated later
                 )
                 state.open_trade = trade
                 state.stop_loss = signal.stop_loss
                 state.take_profit = signal.take_profit or 0.0
                 state.highest_price = signal.entry_price
                 state.lowest_price = signal.entry_price
-                state.trailing_stop = 0.0
+                state.trailing_stop = 0.0 if signal.direction == SignalDirection.LONG else float("inf")
+                state.atr = signal.atr
+                state.entry_price = signal.entry_price
+                state.stop_distance = signal.stop_distance
+                state.partial_done = False
 
         # Force close at end
         if state.open_trade:
@@ -172,15 +246,17 @@ class Backtester:
         trade.exit_reason = reason
 
         if trade.direction == "LONG":
-            trade.pnl = (exit_price - trade.entry_price) * trade.quantity
+            gross = (exit_price - trade.entry_price) * trade.quantity
         else:
-            trade.pnl = (trade.entry_price - exit_price) * trade.quantity
+            gross = (trade.entry_price - exit_price) * trade.quantity
 
-        fee = exit_price * trade.quantity * self._cfg.taker_fee_pct
-        trade.fees = fee
-        trade.pnl -= fee
+        exit_fee = exit_price * trade.quantity * self._cfg.taker_fee_pct
+        trade.fees += exit_fee
+        # pnl = gross price move minus exit fee; entry fee is a sunk cost already
+        # reflected in equity but we keep it in trade.fees for reporting
+        trade.pnl = gross - exit_fee
 
-        self._equity += trade.pnl
+        self._equity += gross - exit_fee  # equity already had entry fee removed at open
         self._equity_curve.append(self._equity)
         self._trades.append(trade)
 

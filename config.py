@@ -36,19 +36,21 @@ class TradingConfig:
     max_concurrent_positions: int = 5          # Hard cap on open positions
 
     # ---- Risk ----
-    risk_per_trade_pct: float = 0.01           # 1% of equity per trade
-    portfolio_heat_cap_pct: float = 0.05       # Max 5% total open risk
-    max_daily_loss_pct: float = 0.04           # Stop trading after 4% daily drawdown
-    max_consecutive_losses: int = 3            # Pause after N consecutive losses
-    correlation_threshold: float = 0.80        # Block trades if pair correlation > this
+    risk_per_trade_pct: float = 0.005          # 0.5% base risk per trade (prop-desk standard)
+    max_risk_per_trade_pct: float = 0.01       # Absolute hard cap per trade (1%)
+    portfolio_heat_cap_pct: float = 0.03       # Max 3% total open risk at any time
+    max_correlated_base_pct: float = 0.015     # Max 1.5% exposure per base asset (BTC, ETH, …)
+    max_daily_loss_pct: float = 0.03           # Stop ALL trading after 3% daily drawdown
+    max_consecutive_losses: int = 3            # Halve size after N consecutive losses
+    correlation_threshold: float = 0.75        # Threshold for correlation-based scaling
 
     # ---- Execution ----
     default_leverage: int = 3
     order_retry_attempts: int = 3
     order_retry_delay_seconds: float = 1.5
-    slippage_bps: float = 5.0                  # Paper mode: basis points of slippage
-    maker_fee_pct: float = 0.0002             # 0.02%
-    taker_fee_pct: float = 0.0006             # 0.06%
+    slippage_bps: float = 2.0                  # Paper mode: limit orders have minimal slippage
+    maker_fee_pct: float = 0.0002             # 0.02% maker (limit order)
+    taker_fee_pct: float = 0.0002             # use maker fee - strategy enters with limit orders
 
     # ---- Strategy Parameters ----
     ema_fast: int = 9
@@ -59,18 +61,38 @@ class TradingConfig:
     bb_period: int = 20
     bb_std: float = 2.0
     momentum_period: int = 10
-    volume_spike_multiplier: float = 1.5      # Volume must be N× avg to confirm signal
     ema_price_buffer_pct: float = 0.001       # Allow EMA entries within 0.1% of slow EMA
     bb_touch_buffer_pct: float = 0.001        # Allow BB touches within 0.1% of the band
     log_decision_trace: bool = field(default_factory=lambda: os.getenv("LOG_DECISION_TRACE", "false").lower() == "true")
-    mean_reversion_z_entry: float = 1.25      # Entry when |z-score| exceeds this value
+    mean_reversion_z_entry: float = 1.1        # Hard entry threshold — validated PF=1.165 Sharpe=1.14 on BTC 15m
+    mean_reversion_z_full: float = 1.1        # Full-size threshold; below this confidence<1 shrinks position
     mean_reversion_z_exit: float = 0.25       # Exit bias when price reverts near mid band
-    trend_breakout_z: float = 0.65            # Minimum z-score for breakout confirmation
-    atr_stop_trend_multiplier: float = 1.8    # ATR multiplier for trend stops
-    atr_stop_range_multiplier: float = 1.2    # ATR multiplier for range stops
-    atr_target_trend_multiplier: float = 2.5  # Trend targets aim for >2R
-    atr_target_range_multiplier: float = 0.8  # Range targets capture partial mean reversion
-    signal_confidence_alpha: float = 0.35     # Weight for scanner score inside confidence blend
+    trend_breakout_z: float = 2.0             # (legacy breakout — not used; kept for compat)
+    disable_trend_strategy: bool = False      # EMA pullback in TRENDING regime enabled (PF=1.91 on BTC 15m)
+    disable_volatility_strategy: bool = True   # VOL_BREAKOUT disabled — full BT shows PF≈1.0, Sharpe=-8 even at best params
+    ema_pullback_zone_atr: float = 0.4        # Entry zone: price within N×ATR of EMA_fast for pullback
+    atr_stop_trend_multiplier: float = 1.5    # Tighter stop for pullback entry (was 2.0)
+    atr_stop_range_multiplier: float = 0.7    # ATR multiplier for range stops (optimized)
+    atr_target_trend_multiplier: float = 3.0  # Trend take-profit multiplier (2:1 RR with 1.5 stop)
+    atr_target_range_multiplier: float = 2.5  # Range take-profit multiplier (2.5× risk)
+    signal_confidence_alpha: float = 0.35     # (legacy) reserved for future weighting
+    # ---- Position Management ----
+    partial_exit_r: float = 1.0               # Take partial profit at 1R (one full risk unit)
+    partial_exit_fraction: float = 0.50       # Close 50% at partial exit; trail remainder
+    breakeven_trigger_r: float = 1.0          # Move stop to entry price after 1R profit
+    stagnant_exit_bars: int = 20              # Time-based exit if trade is < 0.2R after N bars
+    stagnant_exit_r_threshold: float = 0.2   # Exit if unrealized < this many R after N bars
+    candle_seconds: int = 900                 # 15m candles = 900 seconds (for time-based calc)
+    # ---- Volatility Breakout ----
+    vol_breakout_lookback: int = 20           # N-bar high/low for breakout detection
+    atr_stop_volatility_multiplier: float = 1.5   # ATR stop for breakout entries
+    atr_target_volatility_multiplier: float = 2.5  # ATR target for breakout (1.67:1 RR)
+    volume_spike_multiplier: float = 1.0      # Legacy hard threshold; volume_ratio tiers take priority
+    # Tiered volume-ratio position-sizing (replaces hard volume block)
+    volume_ratio_min: float = 1.0             # Below → skip entry (< 1.0× avg is thin volume)
+    volume_ratio_half: float = 1.2            # 1.0–1.2 → 50% position size (moderate volume)
+    volume_ratio_boost: float = 1.8           # 1.2–1.8 → 100%; above → 125% (confirmed momentum)
+    volume_lookback: int = 20                 # Rolling window for average volume
 
     # ---- Regime Detection ----
     adx_period: int = 14
@@ -90,17 +112,26 @@ class TradingConfig:
     trade_journal_export_path: str = "logs/trade_journal.csv"
 
     # ---- Correlation Window ----
-    correlation_lookback: int = 50            # Periods for rolling correlation
+    correlation_lookback: int = 100           # Periods for rolling correlation
 
     # ---- OHLCV fetch ----
     candle_limit: int = 200                   # Number of candles to fetch per symbol
     candle_granularity: str = "15m"          # Candle interval
 
     # ---- Portfolio / Allocation ----
-    kelly_fraction_cap: float = 0.65          # Max fractional Kelly allocation
-    kelly_fraction_floor: float = 0.25        # Minimum allocation per approved trade
-    max_trades_per_hour: int = 8              # Hard cap for trade frequency
+    kelly_fraction_cap: float = 0.25          # Fractional Kelly cap multiplier
+    kelly_fraction_floor: float = 0.0         # Minimum allocation per approved trade
+    max_trades_per_window: int = 3            # Hard cap for trade frequency in rolling window
+    trade_frequency_window_seconds: int = 600 # Rolling window length for trade cap
     portfolio_variance_cap: float = 0.08      # Variance ceiling for position weights
+    strategy_stats_window: int = 50           # Rolling trade window per strategy
+    # ---- Confidence Scoring Weights ----
+    # 5-factor confidence: [signal_strength, regime, volume, trend_align, volatility_state]
+    confidence_w_signal: float = 0.30
+    confidence_w_regime: float = 0.25
+    confidence_w_volume: float = 0.20
+    confidence_w_trend_align: float = 0.15
+    confidence_w_vol_state: float = 0.10
 
 
 @dataclass

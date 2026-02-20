@@ -125,6 +125,50 @@ class MetricsTracker:
         }
         return stats
 
+    def compute_regime_stats(self) -> Dict:
+        """Return per-regime performance breakdown."""
+        with self._lock:
+            trades = list(self._trades)
+
+        if not trades:
+            return {}
+
+        regimes: Dict[str, list] = {}
+        for t in trades:
+            regimes.setdefault(t.regime, []).append(t.pnl)
+
+        result: Dict[str, Dict] = {}
+        for regime, pnls in regimes.items():
+            wins   = [p for p in pnls if p > 0]
+            losses = [p for p in pnls if p <= 0]
+            gp = sum(wins)
+            gl = abs(sum(losses)) if losses else 0.0
+            result[regime] = {
+                "n_trades": len(pnls),
+                "win_rate":       round(len(wins) / len(pnls), 4),
+                "profit_factor":  round(gp / gl, 4) if gl > 0 else float("inf"),
+                "total_pnl":      round(sum(pnls), 2),
+                "avg_win":        round(float(np.mean(wins)), 2) if wins else 0.0,
+                "avg_loss":       round(float(np.mean(losses)), 2) if losses else 0.0,
+            }
+        return result
+
+    def print_regime_summary(self) -> None:
+        stats = self.compute_regime_stats()
+        if not stats:
+            return
+        log.info("=" * 55)
+        log.info("REGIME PERFORMANCE BREAKDOWN")
+        log.info("=" * 55)
+        for regime, s in stats.items():
+            log.info(
+                "  %-18s  n=%3d  WR=%.1f%%  PF=%.3f  PnL=%+.2f",
+                regime, s["n_trades"], s["win_rate"] * 100,
+                s["profit_factor"] if s["profit_factor"] != float("inf") else 999.0,
+                s["total_pnl"],
+            )
+        log.info("=" * 55)
+
     def _compute_sharpe(self, returns: List[float]) -> float:
         if len(returns) < 5:
             return 0.0
@@ -134,9 +178,12 @@ class MetricsTracker:
         periods_per_year = 96 * 365
         excess = arr - (cfg.sharpe_risk_free_rate / periods_per_year)
         std = np.std(excess)
-        if std == 0:
+        # Guard: floating-point near-zero std produces astronomical values
+        if abs(std) < 1e-10:
             return 0.0
-        return float(np.mean(excess) / std * np.sqrt(periods_per_year))
+        raw = float(np.mean(excess) / std * np.sqrt(periods_per_year))
+        # Clamp to a sane range — prevents display/logging of ±inf
+        return max(-100.0, min(100.0, raw))
 
     def _compute_max_drawdown(self, equity: List[float]) -> float:
         if len(equity) < 2:

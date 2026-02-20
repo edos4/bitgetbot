@@ -17,6 +17,7 @@ import time
 import threading
 from datetime import datetime, timezone
 from typing import Dict, Optional
+import pandas as pd
 
 from config import get_config, reload_config
 from logger import setup_logger, get_logger
@@ -33,6 +34,7 @@ from metrics import MetricsTracker, TradeRecord
 from discord_notifier import DiscordNotifier
 from strategy import generate_signal, SignalDirection, compute_trailing_stop
 from backtester import Backtester
+from strategy_stats import StrategyStatsManager
 
 log = get_logger("main")
 
@@ -63,7 +65,7 @@ class TradingEngine:
 
         self._cfg = cfg
         self._mode = cfg.trading.mode
-        log.info("=== Bitget Futures Engine | mode=%s ===", self._mode.upper())
+        log.info("=== Bitget Futures Engine | mode=%s | pid=%d ===", self._mode.upper(), os.getpid())
 
         # Shared components
         self._rest = BitgetRestClient()
@@ -71,7 +73,8 @@ class TradingEngine:
         self._feed = DataFeed(self._rest)
         self._scanner = Scanner(self._feed)
         self._risk = RiskManager()
-        self._portfolio = PortfolioManager(self._feed, self._risk)
+        self._stats = StrategyStatsManager()
+        self._portfolio = PortfolioManager(self._feed, self._risk, self._stats)
         self._metrics = MetricsTracker()
         self._notifier = DiscordNotifier()
 
@@ -93,6 +96,7 @@ class TradingEngine:
             risk=self._risk,
             paper_engine=self._paper if self._mode == "paper" else None,
             rest_client=self._rest if self._mode == "live" else None,
+            stats_manager=self._stats,
         )
 
         self._ws: Optional[BitgetWebSocket] = None
@@ -103,6 +107,11 @@ class TradingEngine:
         self._last_scan_time: float = 0.0
         self._last_correlation_time: float = 0.0
         self._correlation_interval: int = 600  # seconds
+
+        # Regime-block cache: symbol → unix timestamp of last REGIME_BLOCKED
+        # Prevents perpetually blocked symbols from consuming top_n slots
+        self._regime_block_cache: Dict[str, float] = {}
+        self._regime_block_ttl: int = 300  # seconds — re-evaluate after 5 min
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -129,7 +138,11 @@ class TradingEngine:
         self._shutdown()
 
     def _cycle(self) -> None:
+
         """One full scan/trade cycle."""
+        # Guard: do not execute if shutdown is already in progress
+        if _shutdown_event.is_set():
+            return
         now = time.time()
 
         # Refresh universe periodically
@@ -140,9 +153,24 @@ class TradingEngine:
         self._refresh_equity()
 
         equity = self._portfolio.get_equity()
-        log.info("Cycle start | equity=$%.2f | open_pos=%d | daily_pnl=%.2f",
-                 equity, self._portfolio.count_open(),
-                 self._risk.get_daily_pnl())
+        unrealized = sum(
+            p.unrealized_pnl for p in self._portfolio.get_all_positions().values()
+        )
+        log.info(
+            "Cycle start | equity=$%.2f | mtm=$%.2f | unrealized=%.2f | open_pos=%d | daily_pnl=%.2f",
+            equity,
+            equity + unrealized,
+            unrealized,
+            self._portfolio.count_open(),
+            self._risk.get_daily_pnl() + unrealized,
+        )
+
+        # Expire old regime-block cache entries
+        now_ts = time.time()
+        self._regime_block_cache = {
+            sym: ts for sym, ts in self._regime_block_cache.items()
+            if now_ts - ts < self._regime_block_ttl
+        }
 
         # Correlation matrix
         if now - self._last_correlation_time > self._correlation_interval:
@@ -155,6 +183,9 @@ class TradingEngine:
 
         # Exit checks for open positions
         self._check_exits()
+
+        # Partial profit / breakeven / time-based stagnant exits
+        self._manage_open_positions()
 
         # Scan for new opportunities
         universe = self._universe.get_universe()
@@ -183,6 +214,13 @@ class TradingEngine:
                     log.debug("%s: position already open, skipping", sym)
                 continue
 
+            # Skip symbols recently regime-blocked (saves OHLCV fetch + indicator compute)
+            if sym in self._regime_block_cache:
+                if trace_enabled:
+                    remaining = int(self._regime_block_ttl - (time.time() - self._regime_block_cache[sym]))
+                    log.debug("TRACE %s: regime-blocked (cached, %ds remaining)", sym, remaining)
+                continue
+
             df = self._feed.get_ohlcv(sym)
             if df is None or df.empty:
                 if trace_enabled:
@@ -192,8 +230,11 @@ class TradingEngine:
                 continue
 
             signals_evaluated += 1
-            signal = generate_signal(sym, df, score.score)
+            signal = generate_signal(sym, df)
             if signal.direction == SignalDirection.NONE:
+                # Cache regime-blocked symbols so we skip them next N cycles
+                if signal.reason == "REGIME_BLOCKED":
+                    self._regime_block_cache[sym] = time.time()
                 if trace_enabled:
                     log.info(
                         "TRACE %s: no signal | strat=%s | conf=%.2f | regime=%s | reason=%s",
@@ -261,6 +302,63 @@ class TradingEngine:
         # Record equity snapshot
         self._metrics.record_equity(equity)
         self._last_scan_time = now
+
+    def _manage_open_positions(self) -> None:
+        """Manage active positions each cycle:
+        1. Partial profit take at 1R — close partial_exit_fraction of the position.
+        2. Move stop to breakeven after 1R profit is locked.
+        3. Time-based stagnant exit — close if < stagnant_exit_r_threshold R after N bars.
+        """
+        prices = self._get_current_prices()
+        cfg = self._cfg.trading
+
+        for sym, pos in list(self._portfolio.get_all_positions().items()):
+            price = prices.get(sym)
+            if not price:
+                continue
+
+            risk_ref = pos.risk_dollar if pos.risk_dollar > 0 else (pos.stop_distance * pos.quantity)
+            if risk_ref <= 0:
+                continue
+
+            # Unrealized PnL in R multiples
+            pos.update_price(price)
+            r_current = pos.unrealized_pnl / (risk_ref + 1e-10)
+
+            # 1. Partial profit: take 50% off the table at 1R
+            if not pos.partial_taken and r_current >= cfg.partial_exit_r:
+                taken = self._executor.partial_close_position(
+                    sym, price, fraction=cfg.partial_exit_fraction, reason="PARTIAL_1R"
+                )
+                if taken:
+                    pnl_partial = pos.unrealized_pnl * cfg.partial_exit_fraction
+                    rec = TradeRecord(
+                        trade_id=f"{sym}_P_{int(time.time())}",
+                        symbol=sym, direction=pos.direction.value,
+                        entry_price=pos.entry_price, exit_price=price,
+                        quantity=pos.quantity * cfg.partial_exit_fraction,
+                        pnl=pnl_partial, pnl_pct=pnl_partial / (pos.entry_price * pos.quantity + 1e-10),
+                        fees=price * pos.quantity * cfg.partial_exit_fraction * cfg.taker_fee_pct,
+                        entry_time=pos.entry_time.isoformat(),
+                        exit_time=datetime.now(timezone.utc).isoformat(),
+                        duration_seconds=(datetime.now(timezone.utc) - pos.entry_time).total_seconds(),
+                        regime=pos.regime, exit_reason="PARTIAL_1R",
+                        stop_loss=pos.stop_loss, take_profit=pos.take_profit,
+                        strategy=pos.strategy, confidence=pos.signal_confidence,
+                        kelly_fraction=pos.kelly_fraction,
+                    )
+                    self._metrics.record_trade(rec)
+                    self._notifier.trade_closed(
+                        sym, pos.direction.value, pos.entry_price, price,
+                        pnl_partial, pnl_partial / (pos.entry_price * pos.quantity + 1e-10), "PARTIAL_1R"
+                    )
+
+            # 2. Move stop to breakeven once 1R is achieved
+            if not pos.breakeven_set and r_current >= cfg.breakeven_trigger_r:
+                self._executor.set_breakeven_stop(sym, price)
+
+            # 3. Time-based stagnant exit
+            self._executor.check_time_based_exit(sym, price)
 
     def _check_exits(self) -> None:
         """Check all open positions for stop/target hits."""
@@ -330,7 +428,12 @@ class TradingEngine:
 
     def _refresh_equity(self) -> None:
         if self._mode == "paper":
-            equity = self._paper.get_equity()
+            # Cash from closed trades + unrealized PnL from open positions = true MTM equity
+            cash = self._paper.get_equity()
+            unrealized = sum(
+                p.unrealized_pnl for p in self._portfolio.get_all_positions().values()
+            )
+            equity = cash + unrealized
         else:
             try:
                 acct = self._rest.get_account()
@@ -361,12 +464,42 @@ class TradingEngine:
         if self._ws:
             self._ws.stop()
 
-        # Close all positions
+        # Close all positions and record each trade to the journal
         prices = self._get_current_prices()
+        exit_ts = datetime.now(timezone.utc)
         for sym in list(self._portfolio.get_open_symbols()):
             price = prices.get(sym, 0)
-            if price:
-                self._executor.close_position(sym, price, "SHUTDOWN")
+            if not price:
+                continue
+            pos = self._portfolio.get_position(sym)  # capture before close
+            self._executor.close_position(sym, price, "SHUTDOWN")
+            if pos:
+                if pos.direction == SignalDirection.LONG:
+                    pnl = (price - pos.entry_price) * pos.quantity
+                else:
+                    pnl = (pos.entry_price - price) * pos.quantity
+                rec = TradeRecord(
+                    trade_id=f"{sym}_{int(time.time())}",
+                    symbol=sym,
+                    direction=pos.direction.value,
+                    entry_price=pos.entry_price,
+                    exit_price=price,
+                    quantity=pos.quantity,
+                    pnl=pnl,
+                    pnl_pct=pnl / (pos.entry_price * pos.quantity + 1e-10),
+                    fees=pos.entry_price * pos.quantity * self._cfg.trading.taker_fee_pct,
+                    entry_time=pos.entry_time.isoformat(),
+                    exit_time=exit_ts.isoformat(),
+                    duration_seconds=(exit_ts - pos.entry_time).total_seconds(),
+                    regime=pos.regime,
+                    exit_reason="SHUTDOWN",
+                    stop_loss=pos.stop_loss,
+                    take_profit=pos.take_profit,
+                    strategy=pos.strategy,
+                    confidence=pos.signal_confidence,
+                    kelly_fraction=pos.kelly_fraction,
+                )
+                self._metrics.record_trade(rec)
 
         # Export analytics
         os.makedirs("logs", exist_ok=True)
@@ -376,6 +509,7 @@ class TradingEngine:
             self._paper.export_equity_curve(self._cfg.trading.equity_curve_export_path)
 
         self._metrics.print_summary()
+        self._metrics.print_regime_summary()
         stats = self._metrics.compute_stats()
         self._notifier.daily_summary(stats)
         log.info("Engine stopped cleanly.")
@@ -385,17 +519,43 @@ class TradingEngine:
 # Backtest entry point
 # -----------------------------------------------------------------------
 
-def run_backtest(symbol: str = "BTCUSDT", candle_limit: int = 1000) -> None:
+def run_backtest(symbol: str = "BTCUSDT", candle_limit: int = 1000, granularity: str = "15m") -> None:
     cfg = get_config()
-    rest = BitgetRestClient()
-    log.info("Fetching %d candles for %s backtest …", candle_limit, symbol)
 
-    raw = rest.get_candles(symbol, granularity=cfg.trading.candle_granularity, limit=candle_limit)
-    from data_feed import candles_to_df
-    df = candles_to_df(raw)
+    # Try cached CSV first (Bitget API may be blocked)
+    import os
+    csv_path = f"logs/cached_{symbol.lower()}_{granularity}.csv"
+    df = pd.DataFrame()
+
+    if os.path.exists(csv_path):
+        log.info("Loading cached data from %s", csv_path)
+        df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+        log.info("Loaded %d bars (%s → %s)", len(df), df.index[0], df.index[-1])
+    else:
+        log.info("Fetching %d × %s candles for %s backtest …", candle_limit, granularity, symbol)
+        rest = BitgetRestClient()
+        try:
+            raw = rest.get_candles(symbol, granularity=granularity, limit=candle_limit)
+            from data_feed import candles_to_df
+            df = candles_to_df(raw)
+        except Exception as e:
+            log.error("Bitget API failed: %s. Trying yfinance fallback...", e)
+
+        if df.empty:
+            # yfinance fallback
+            try:
+                import yfinance as yf
+                ticker = yf.Ticker(f"{symbol[:3]}-USD")
+                df = ticker.history(period="60d", interval=granularity)
+                df.columns = [c.lower() for c in df.columns]
+                df = df[["open", "high", "low", "close", "volume"]].dropna()
+                df.to_csv(csv_path)
+                log.info("Fetched %d bars via yfinance, saved to %s", len(df), csv_path)
+            except Exception as e2:
+                log.error("yfinance also failed: %s", e2)
 
     if df.empty:
-        log.error("No data returned for %s", symbol)
+        log.error("No data available for %s", symbol)
         return
 
     bt = Backtester(initial_equity=10_000.0)
@@ -421,6 +581,11 @@ def main() -> None:
         help="Symbol for backtest mode (default: BTCUSDT)"
     )
     parser.add_argument(
+        "--granularity",
+        default="15m",
+        help="Candle granularity for backtest mode (default: 15m)"
+    )
+    parser.add_argument(
         "--equity",
         type=float,
         default=10_000.0,
@@ -435,8 +600,25 @@ def main() -> None:
     log.info("Starting engine | mode=%s", mode)
 
     if mode == "backtest":
-        run_backtest(symbol=args.symbol)
+        run_backtest(symbol=args.symbol, granularity=args.granularity)
     else:
+        # PID lock file — prevent dual instances
+        pid_file = os.path.join(cfg.log_dir, "trading.pid")
+        os.makedirs(cfg.log_dir, exist_ok=True)
+        if os.path.exists(pid_file):
+            try:
+                with open(pid_file) as _pf:
+                    old_pid = int(_pf.read().strip())
+                os.kill(old_pid, signal.SIGTERM)
+                log.warning("Sent SIGTERM to previous instance (PID %d) — waiting 2s", old_pid)
+                time.sleep(2)
+            except (ProcessLookupError, ValueError, OSError):
+                pass  # already dead
+        with open(pid_file, "w") as _pf:
+            _pf.write(str(os.getpid()))
+        import atexit
+        atexit.register(lambda: os.remove(pid_file) if os.path.exists(pid_file) else None)
+
         engine = TradingEngine(mode_override=mode)
         engine.run()
 

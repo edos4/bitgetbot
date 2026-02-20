@@ -66,18 +66,37 @@ class DataFeed:
             df = candles_to_df(raw)
             if df.empty:
                 log.warning("Empty candle data for %s", symbol)
-                return None
+                return self._csv_fallback(symbol)
 
             with self._lock:
                 self._cache[symbol] = {"df": df, "fetched_at": time.time()}
             return df
 
         except Exception as e:
-            log.error("Failed to fetch candles for %s: %s", symbol, e)
-            # Return stale if available
+            log.warning("Failed to fetch candles for %s: %s — trying CSV fallback", symbol, e)
+            return self._csv_fallback(symbol)
+
+    def _csv_fallback(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Load most recent candle_limit rows from cached CSV for paper/backtest mode."""
+        import os
+        gran = self._cfg.candle_granularity
+        sym_lower = symbol.lower()
+        csv_path = f"logs/cached_{sym_lower}_{gran}.csv"
+        if not os.path.exists(csv_path):
+            log.warning("No CSV fallback for %s at %s", symbol, csv_path)
+            return None
+        try:
+            df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+            df = df[["open", "high", "low", "close", "volume"]].dropna()
+            # Return last candle_limit rows to simulate live data window
+            df = df.tail(self._cfg.candle_limit).reset_index(drop=True)
+            log.debug("CSV fallback: %d bars for %s", len(df), symbol)
             with self._lock:
-                entry = self._cache.get(symbol)
-                return entry["df"] if entry else None
+                self._cache[symbol] = {"df": df, "fetched_at": time.time()}
+            return df
+        except Exception as e:
+            log.error("CSV fallback failed for %s: %s", symbol, e)
+            return None
 
     def bulk_fetch(self, symbols: List[str], max_workers: int = 8) -> Dict[str, pd.DataFrame]:
         """Fetch candles for multiple symbols using a thread pool."""

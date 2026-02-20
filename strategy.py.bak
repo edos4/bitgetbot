@@ -1,0 +1,279 @@
+"""Adaptive multi-strategy signal generation with strict regime gating."""
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
+import pandas as pd
+import ta
+
+from config import get_config
+from regime import Regime, RegimeState, detect_regime
+from logger import get_logger
+
+log = get_logger("strategy")
+
+
+class SignalDirection(str, Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
+    NONE = "NONE"
+
+
+@dataclass
+class Signal:
+    symbol: str
+    direction: SignalDirection
+    entry_price: float
+    stop_loss: float
+    take_profit: Optional[float]
+    regime: Regime
+    stop_distance: float
+    reward_risk_ratio: float
+    atr: float
+    reason: str
+    strategy: str
+    atr_ratio: float
+    confidence: float = 0.0
+
+
+def generate_signal(symbol: str, df: pd.DataFrame) -> Signal:
+    """Return a signal only if the active regime authorises that strategy."""
+    cfg = get_config().trading
+    regime_state = detect_regime(df)
+    close = df["close"]
+    current_price = float(close.iloc[-1])
+    atr = _compute_atr(df)
+
+    if regime_state.primary == Regime.TRENDING:
+        return _trend_following_signal(symbol, df, current_price, atr, regime_state)
+    if regime_state.primary == Regime.RANGING:
+        return _mean_reversion_signal(symbol, df, current_price, atr, regime_state)
+
+    return _no_signal(symbol, current_price, atr, regime_state.primary, "REGIME_BLOCKED", "NONE", regime_state.atr_ratio)
+
+
+def _compute_htf_trend(df: pd.DataFrame, resample_n: int = 4) -> int:
+    """
+    Downsample df by folding every resample_n bars into 1H-equivalent OHLCV.
+    Return +1 if HTF EMA9 > EMA21 (bullish), -1 if bearish, 0 if neutral.
+    Needs at least 30 bars of resampled data.
+    """
+    try:
+        n = resample_n
+        rows = (len(df) // n) * n
+        if rows < n * 30:
+            return 0
+        # Use integer position for grouping (works with both int and datetime index)
+        sliced = df.iloc[-rows:].copy()
+        sliced = sliced.reset_index(drop=True)  # ensure 0-based int index
+        groups = sliced.groupby(sliced.index // n)
+        htf = pd.DataFrame({
+            "open":  groups["open"].first(),
+            "high":  groups["high"].max(),
+            "low":   groups["low"].min(),
+            "close": groups["close"].last(),
+            "volume": groups["volume"].sum(),
+        })
+        ema_fast = ta.trend.EMAIndicator(close=htf["close"], window=9).ema_indicator()
+        ema_slow = ta.trend.EMAIndicator(close=htf["close"], window=21).ema_indicator()
+        if ema_fast.empty or ema_slow.empty or pd.isna(ema_fast.iloc[-1]) or pd.isna(ema_slow.iloc[-1]):
+            return 0
+        diff = float(ema_fast.iloc[-1]) - float(ema_slow.iloc[-1])
+        if diff > 0:
+            return 1
+        if diff < 0:
+            return -1
+    except Exception:
+        pass
+    return 0
+
+
+def _volume_is_spiking(df: pd.DataFrame, lookback: int = 20, multiplier: float = 1.3) -> bool:
+    """Return True if the last bar's volume exceeds multiplier × mean of prior lookback bars."""
+    if len(df) < lookback + 1:
+        return False
+    avg_vol = float(df["volume"].iloc[-(lookback + 1):-1].mean())
+    last_vol = float(df["volume"].iloc[-1])
+    return last_vol >= avg_vol * multiplier
+
+
+def _trend_following_signal(
+    symbol: str,
+    df: pd.DataFrame,
+    price: float,
+    atr: float,
+    regime_state: RegimeState,
+) -> Signal:
+    cfg = get_config().trading
+    close = df["close"]
+    ema_fast = ta.trend.EMAIndicator(close=close, window=cfg.ema_fast).ema_indicator()
+    ema_slow = ta.trend.EMAIndicator(close=close, window=cfg.ema_slow).ema_indicator()
+
+    if ema_fast.empty or ema_slow.empty:
+        return _no_signal(symbol, price, atr, regime_state.primary, "EMA_NOT_READY", "TREND", regime_state.atr_ratio)
+
+    ema_fast_cur = float(ema_fast.iloc[-1])
+    ema_slow_cur = float(ema_slow.iloc[-1])
+    ema_diff = ema_fast_cur - ema_slow_cur
+    price_z = (price - ema_slow_cur) / (atr + 1e-10)
+
+    if abs(price_z) < cfg.trend_breakout_z or ema_diff == 0:
+        return _no_signal(symbol, price, atr, regime_state.primary, "TREND_BREAKOUT_INACTIVE", "TREND", regime_state.atr_ratio)
+
+    # Volume spike gate: require above-average volume on entry
+    if not _volume_is_spiking(df, lookback=20, multiplier=cfg.volume_spike_multiplier):
+        return _no_signal(symbol, price, atr, regime_state.primary, "LOW_VOLUME", "TREND", regime_state.atr_ratio)
+
+    # Multi-timeframe filter: HTF EMA must agree with signal direction
+    htf = _compute_htf_trend(df, resample_n=4)
+    tentative_dir = 1 if ema_diff > 0 else -1
+    if htf != 0 and htf != tentative_dir:
+        return _no_signal(symbol, price, atr, regime_state.primary, "HTF_CONFLICT", "TREND", regime_state.atr_ratio)
+
+    direction = SignalDirection.LONG if ema_diff > 0 else SignalDirection.SHORT
+    stop_distance = atr * cfg.atr_stop_trend_multiplier
+    target_mult = cfg.atr_target_trend_multiplier
+    reward_risk = target_mult / cfg.atr_stop_trend_multiplier
+
+    if direction == SignalDirection.LONG:
+        stop = price - stop_distance
+        target = price + stop_distance * reward_risk
+    else:
+        stop = price + stop_distance
+        target = price - stop_distance * reward_risk
+
+    confidence = min(1.0, abs(price_z) / (cfg.trend_breakout_z + 1e-10))
+
+    return Signal(
+        symbol=symbol,
+        direction=direction,
+        entry_price=price,
+        stop_loss=stop,
+        take_profit=target,
+        regime=regime_state.primary,
+        stop_distance=stop_distance,
+        reward_risk_ratio=reward_risk,
+        atr=atr,
+        reason="TREND_BREAKOUT",
+        strategy="TREND",
+        atr_ratio=regime_state.atr_ratio,
+        confidence=confidence,
+    )
+
+
+def _mean_reversion_signal(
+    symbol: str,
+    df: pd.DataFrame,
+    price: float,
+    atr: float,
+    regime_state: RegimeState,
+) -> Signal:
+    cfg = get_config().trading
+    close = df["close"]
+    bb = ta.volatility.BollingerBands(close=close, window=cfg.bb_period, window_dev=cfg.bb_std)
+    bb_mid = bb.bollinger_mavg()
+    bb_up = bb.bollinger_hband()
+    bb_low = bb.bollinger_lband()
+
+    if bb_mid.empty or bb_up.empty or bb_low.empty:
+        return _no_signal(symbol, price, atr, regime_state.primary, "BB_NOT_READY", "MEAN_REVERSION", regime_state.atr_ratio)
+
+    mid = float(bb_mid.iloc[-1])
+    up = float(bb_up.iloc[-1])
+    low = float(bb_low.iloc[-1])
+    band_width = (up - mid) + 1e-10
+    z_score = (price - mid) / band_width
+
+    direction = SignalDirection.NONE
+    reason = "BB_ZSCORE_NEUTRAL"
+
+    if z_score <= -cfg.mean_reversion_z_entry:
+        direction = SignalDirection.LONG
+        reason = "BB_ZSCORE_LONG"
+    elif z_score >= cfg.mean_reversion_z_entry:
+        direction = SignalDirection.SHORT
+        reason = "BB_ZSCORE_SHORT"
+
+    if direction == SignalDirection.NONE:
+        return _no_signal(symbol, price, atr, regime_state.primary, reason, "MEAN_REVERSION", regime_state.atr_ratio)
+
+    # Volume spike gate for mean reversion too
+    if not _volume_is_spiking(df, lookback=20, multiplier=cfg.volume_spike_multiplier):
+        return _no_signal(symbol, price, atr, regime_state.primary, "LOW_VOLUME", "MEAN_REVERSION", regime_state.atr_ratio)
+
+    stop_distance = atr * cfg.atr_stop_range_multiplier
+    reward_risk = cfg.atr_target_range_multiplier / cfg.atr_stop_range_multiplier
+    if direction == SignalDirection.LONG:
+        stop = price - stop_distance
+        target = price + stop_distance * reward_risk
+    else:
+        stop = price + stop_distance
+        target = price - stop_distance * reward_risk
+
+    confidence = min(1.0, abs(z_score) / (cfg.mean_reversion_z_entry + 1e-10))
+
+    return Signal(
+        symbol=symbol,
+        direction=direction,
+        entry_price=price,
+        stop_loss=stop,
+        take_profit=target,
+        regime=regime_state.primary,
+        stop_distance=stop_distance,
+        reward_risk_ratio=reward_risk,
+        atr=atr,
+        reason=reason,
+        strategy="MEAN_REVERSION",
+        atr_ratio=regime_state.atr_ratio,
+        confidence=confidence,
+    )
+
+
+def _no_signal(
+    symbol: str,
+    price: float,
+    atr: float,
+    regime: Regime,
+    reason: str,
+    strategy: str,
+    atr_ratio: float,
+) -> Signal:
+    return Signal(
+        symbol=symbol,
+        direction=SignalDirection.NONE,
+        entry_price=price,
+        stop_loss=0.0,
+        take_profit=None,
+        regime=regime,
+        stop_distance=0.0,
+        reward_risk_ratio=0.0,
+        atr=atr,
+        reason=reason,
+        strategy=strategy,
+        atr_ratio=atr_ratio,
+        confidence=0.0,
+    )
+
+
+def _compute_atr(df: pd.DataFrame) -> float:
+    cfg = get_config().trading
+    atr_ind = ta.volatility.AverageTrueRange(
+        high=df["high"], low=df["low"], close=df["close"], window=cfg.atr_period
+    )
+    atr_series = atr_ind.average_true_range().dropna()
+    if len(atr_series) == 0:
+        close = df["close"]
+        return float(close.iloc[-1]) * 0.01
+    return float(atr_series.iloc[-1])
+
+
+def compute_trailing_stop(
+    direction: SignalDirection,
+    current_price: float,
+    highest_price: float,
+    atr: float,
+) -> float:
+    cfg = get_config().trading
+    mult = cfg.atr_trailing_multiplier
+    if direction == SignalDirection.LONG:
+        return highest_price - atr * mult
+    return highest_price + atr * mult

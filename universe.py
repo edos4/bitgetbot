@@ -35,7 +35,13 @@ class UniverseManager:
             tickers = self._rest.get_usdt_perpetuals()
         except Exception as e:
             log.error("Failed to fetch universe: %s", e)
-            return self._universe  # return stale
+            if not self._universe:
+                # Fallback to known liquid symbols when API is blocked
+                log.warning("API unreachable — using fallback universe [BTCUSDT, ETHUSDT]")
+                with self._lock:
+                    self._universe = ["BTCUSDT", "ETHUSDT"]
+                    self._last_refresh = time.time()
+            return self._universe  # return stale/fallback
 
         eligible: List[str] = []
         ticker_map: Dict[str, Dict] = {}

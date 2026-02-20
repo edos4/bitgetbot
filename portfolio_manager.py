@@ -11,6 +11,7 @@ import pandas as pd
 
 from config import get_config
 from strategy import SignalDirection
+from strategy_stats import StrategyStatsManager
 from logger import get_logger
 
 log = get_logger("portfolio")
@@ -34,6 +35,13 @@ class Position:
     strategy: str = "UNKNOWN"
     signal_confidence: float = 0.0
     kelly_fraction: float = 0.0
+    stop_distance: float = 0.0
+    reward_risk_ratio: float = 0.0
+    risk_fraction: float = 0.0
+    risk_dollar: float = 0.0
+    # Position management state flags
+    partial_taken: bool = False       # True once 50% partial profit has been locked at 1R
+    breakeven_set: bool = False       # True once stop has been moved to entry price after 1R
 
     def update_price(self, current_price: float) -> None:
         if self.direction == SignalDirection.LONG:
@@ -52,13 +60,15 @@ class PortfolioManager:
     Thread-safe.
     """
 
-    def __init__(self, data_feed, risk_manager) -> None:
+    def __init__(self, data_feed, risk_manager, stats_manager: StrategyStatsManager) -> None:
         self._feed = data_feed
         self._risk = risk_manager
         self._cfg = get_config().trading
+        self._stats = stats_manager
         self._lock = threading.Lock()
         self._positions: Dict[str, Position] = {}    # symbol → Position
         self._equity: float = 0.0
+        self._correlations: Dict[str, Dict[str, float]] = {}
 
     # ------------------------------------------------------------------ #
     # Position management
@@ -83,7 +93,10 @@ class PortfolioManager:
         else:
             pnl = (pos.entry_price - exit_price) * pos.quantity
 
-        self._risk.register_trade_close(symbol, pnl)
+        self._risk.register_trade_close(symbol, pnl, reason)
+        risk_dollar = pos.risk_dollar if pos.risk_dollar > 0 else pos.stop_distance * pos.quantity
+        r_multiple = pnl / (risk_dollar + 1e-10)
+        self._stats.record_trade(pos.strategy, r_multiple, pnl)
         log.info("Position closed: %s @ %.4f | PnL=%.2f | reason=%s",
                  symbol, exit_price, pnl, reason)
         return pos
@@ -156,6 +169,11 @@ class PortfolioManager:
             log.error("Correlation computation failed: %s", e)
             return {}
 
+        self._correlations = {
+            sym: {other: float(corr.loc[sym, other]) for other in corr.columns if other != sym}
+            for sym in corr.columns
+        }
+
         blocks: Dict[str, List[str]] = {}
         syms = list(corr.columns)
         for i, sym_a in enumerate(syms):
@@ -167,9 +185,6 @@ class PortfolioManager:
                         correlated.append(sym_b)
             if correlated:
                 blocks[sym_a] = correlated
-
-        # Update risk manager
-        self._risk.update_correlation_blocks(blocks)
 
         # Log high correlations
         reported = set()
@@ -207,6 +222,15 @@ class PortfolioManager:
     def get_total_unrealized_pnl(self) -> float:
         with self._lock:
             return sum(p.unrealized_pnl for p in self._positions.values())
+
+    def get_max_correlation(self, symbol: str) -> float:
+        with self._lock:
+            row = self._correlations.get(symbol, {})
+            open_syms = set(self._positions.keys())
+        if not row:
+            return 0.0
+        vals = [abs(v) for other, v in row.items() if other in open_syms]
+        return max(vals) if vals else 0.0
 
     # ------------------------------------------------------------------ #
     # Portfolio variance guard
