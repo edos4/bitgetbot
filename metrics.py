@@ -226,13 +226,15 @@ class MetricsTracker:
             return path
 
         fieldnames = list(asdict(trades[0]).keys())
-        with open(path, "w", newline="") as f:
+        file_exists = os.path.isfile(path) and os.path.getsize(path) > 0
+        with open(path, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
+            if not file_exists:
+                writer.writeheader()
             for t in trades:
                 writer.writerow(asdict(t))
 
-        log.info("Trade journal exported: %d trades → %s", len(trades), path)
+        log.info("Trade journal appended: %d trades → %s", len(trades), path)
         return path
 
     def export_equity_curve(self, path: Optional[str] = None) -> str:

@@ -84,7 +84,7 @@ class TradingConfig:
     mean_reversion_z_full: float = 1.1        # Full-size threshold; below this confidence<1 shrinks position
     mean_reversion_z_exit: float = 0.25       # Exit bias when price reverts near mid band
     trend_breakout_z: float = 2.0             # (legacy breakout — not used; kept for compat)
-    disable_trend_strategy: bool = False      # EMA pullback in TRENDING regime enabled (PF=1.91 on BTC 15m)
+    disable_trend_strategy: bool = True       # TREND_PULLBACK disabled: losing strategy in all 6 live sessions; largest aggregate loss source across TRENDING regime
     disable_volatility_strategy: bool = True   # VOL_BREAKOUT disabled — full BT shows PF≈1.0, Sharpe=-8 even at best params
     disable_momentum_strategy: bool = False    # Donchian momentum breakout — active in TRENDING + RANGING
     ema_pullback_zone_atr: float = 1.0        # Default zone (fallback / HIGH_VOLATILITY)
