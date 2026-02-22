@@ -65,18 +65,34 @@ class ExecutionEngine:
             log.warning("❌ Trade rejected [%s]: stop_loss=%.10f ≤ 0", signal.symbol, signal.stop_loss)
             return False
 
-        # 2. ATR must be ≥ 0.005% of entry price — prevents division-by-zero and trivial sizing
+        # 2. ATR must be non-zero and ≥ 0.005% of entry price — catches DOGE/zero-ATR data issues
+        if signal.atr == 0.0:
+            log.warning(
+                "❌ Trade rejected [%s]: ATR=0.0 (no ATR data — data quality failure)",
+                signal.symbol,
+            )
+            return False
         min_atr_abs = signal.entry_price * self._cfg.min_atr_fraction
-        if signal.atr <= 0 or signal.atr < min_atr_abs:
+        if signal.atr < min_atr_abs:
             log.warning(
                 "\u274c Trade rejected [%s]: ATR=%.10f below min (%.10f = %.3f%% of price)",
                 signal.symbol, signal.atr, min_atr_abs, self._cfg.min_atr_fraction * 100,
             )
             return False
 
+        # 3a. Stop distance must be ≥ min_stop_fraction% of entry price (conservative 0.05% floor)
+        #     Catches degenerate stops from near-zero ATR (e.g. DOGE with stop=entry)
+        if self._cfg.min_stop_fraction > 0:
+            min_stop_pct_abs = signal.entry_price * self._cfg.min_stop_fraction
+            if signal.stop_distance < min_stop_pct_abs:
+                log.warning(
+                    "❌ Trade rejected [%s]: stop_distance=%.8f below price floor (%.8f = %.3f%% of entry)",
+                    signal.symbol, signal.stop_distance,
+                    min_stop_pct_abs, self._cfg.min_stop_fraction * 100,
+                )
+                return False
+
         # 3b. Stop distance must be ≥ 1.5× ATR — ensures stop is not within intrabar noise.
-        #     (Price-% floor removed: min_atr_fraction already rejects near-zero ATR symbols;
-        #      a flat 0.25% floor blocked every normal 1m signal on XRP/SOL/ETH/BTC.)
         min_stop_by_atr = signal.atr * self._cfg.min_stop_atr_multiple
         if signal.stop_distance < min_stop_by_atr:
             log.warning(
@@ -204,6 +220,15 @@ class ExecutionEngine:
                 "⚠ Same-direction decay [%s]: %d %s open → risk ×%.2f",
                 signal.symbol, same_dir_count, signal.direction.value, decay_factor,
             )
+        # Dust-trade suppression: after all scalars applied, if risk_fraction < 0.01% of equity,
+        # skip entirely — a near-zero-sized position wastes fees and clogs portfolio state.
+        if risk_fraction < 0.0001:
+            log.info(
+                "❌ Trade blocked [%s]: risk_fraction=%.6f%% after scaling — dust trade suppressed",
+                signal.symbol, risk_fraction * 100,
+            )
+            return False
+
         # Only enforce once strategy has min_ev_sample closed trades.
         # EV = RR × win_rate − (1 − win_rate)
         stats_snapshot = self._stats.get_snapshot(signal.strategy)

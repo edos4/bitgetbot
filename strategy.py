@@ -346,6 +346,19 @@ def _ema_pullback_from_cache(
                           f"VOL_RATIO_LOW({vol_ratio:.2f})", "TREND_PULLBACK", regime_state.atr_ratio)
 
     direction = SignalDirection.LONG if ema_diff > 0 else SignalDirection.SHORT
+
+    # Momentum confirmation for TREND_PULLBACK LONGs in TRENDING regime:
+    # RSI must be > rsi_momentum_long_min (default 55) to confirm upside momentum.
+    # Prevents entries in weak pullbacks that resume the downside.
+    if regime_state.primary.value == "TRENDING" and direction == SignalDirection.LONG:
+        rsi_val = cache.get_rsi(idx)
+        if rsi_val < cfg.rsi_momentum_long_min:
+            return _no_signal(
+                symbol, price, atr, regime_state.primary,
+                f"RSI_WEAK({rsi_val:.1f}<{cfg.rsi_momentum_long_min:.0f})",
+                "TREND_PULLBACK", regime_state.atr_ratio,
+            )
+
     stop_distance = atr * cfg.atr_stop_trend_multiplier
     reward_risk   = cfg.atr_target_trend_multiplier / cfg.atr_stop_trend_multiplier
 
@@ -412,6 +425,18 @@ def _ema_pullback_signal(
                           f"VOL_RATIO_LOW({vol_ratio:.2f})", "TREND_PULLBACK", regime_state.atr_ratio)
 
     direction = SignalDirection.LONG if ema_diff > 0 else SignalDirection.SHORT
+
+    # Momentum confirmation for TREND_PULLBACK LONGs in TRENDING regime (live path)
+    if regime_state.primary.value == "TRENDING" and direction == SignalDirection.LONG:
+        rsi_s = ta.momentum.RSIIndicator(close=df["close"], window=cfg.rsi_period).rsi()
+        rsi_val = float(rsi_s.iloc[-1]) if not rsi_s.empty and not pd.isna(rsi_s.iloc[-1]) else 50.0
+        if rsi_val < cfg.rsi_momentum_long_min:
+            return _no_signal(
+                symbol, price, atr, regime_state.primary,
+                f"RSI_WEAK({rsi_val:.1f}<{cfg.rsi_momentum_long_min:.0f})",
+                "TREND_PULLBACK", regime_state.atr_ratio,
+            )
+
     stop_distance = atr * cfg.atr_stop_trend_multiplier
     reward_risk   = cfg.atr_target_trend_multiplier / cfg.atr_stop_trend_multiplier
 
