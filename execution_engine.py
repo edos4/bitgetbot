@@ -110,11 +110,22 @@ class ExecutionEngine:
                 signal.symbol, self._trades_this_cycle, max_per_cycle,
             )
             return False
-        # Minimum signal confidence gate: weak conf = noise on 1m
-        if signal.confidence < self._cfg.min_signal_confidence:
+        # Minimum signal confidence gate: regime-adaptive
+        # TRENDING + TREND_PULLBACK: requires 0.70 (4 sessions of loss in this combo at 0.45)
+        # RANGING regime: relaxed to 0.40 (only profitable regime, broader signals welcome)
+        # Default: 0.45 (existing min_signal_confidence)
+        if signal.regime.value == "RANGING":
+            effective_min_conf = self._cfg.min_signal_confidence_ranging
+        elif (signal.regime.value == "TRENDING"
+              and signal.strategy == "TREND_PULLBACK"):
+            effective_min_conf = self._cfg.trend_pullback_trending_min_conf
+        else:
+            effective_min_conf = self._cfg.min_signal_confidence
+        if signal.confidence < effective_min_conf:
             log.info(
-                "\u274c Trade blocked [%s]: conf=%.2f below min=%.2f",
-                signal.symbol, signal.confidence, self._cfg.min_signal_confidence,
+                "\u274c Trade blocked [%s]: conf=%.2f below regime-adaptive min=%.2f (%s/%s)",
+                signal.symbol, signal.confidence, effective_min_conf,
+                signal.regime.value, signal.strategy,
             )
             return False
         if not self._can_trade_now():

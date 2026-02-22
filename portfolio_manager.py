@@ -42,6 +42,7 @@ class Position:
     # Position management state flags
     partial_taken: bool = False       # True once 50% partial profit has been locked at 1R
     breakeven_set: bool = False       # True once stop has been moved to entry price after 1R
+    entry_rs_score: float = 0.0       # RS-vs-BTC score at time of entry (for deterioration exit)
 
     def update_price(self, current_price: float) -> None:
         if self.direction == SignalDirection.LONG:

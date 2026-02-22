@@ -39,6 +39,7 @@ class TradeRecord:
     strategy: str
     confidence: float
     kelly_fraction: float
+    is_partial: bool = False   # PARTIAL_1R records are sub-trades; excluded from WR/avg stats
 
 
 class MetricsTracker:
@@ -91,7 +92,11 @@ class MetricsTracker:
         if not trades:
             return {"status": "no_trades"}
 
-        pnls = [t.pnl for t in trades]
+        # Exclude PARTIAL_1R sub-records from aggregate stats — they inflate WR
+        # (a partial close + subsequent breakeven exit looks like win+loss instead of one trade)
+        full_trades = [t for t in trades if not t.is_partial]
+        pnls = [t.pnl for t in full_trades] if full_trades else [t.pnl for t in trades]
+        all_pnls = [t.pnl for t in trades]  # for total_pnl including partials
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
 
@@ -120,11 +125,12 @@ class MetricsTracker:
             "starting_balance": round(starting, 2),
             "ending_balance": round(ending, 2),
             "total_trades": len(trades),
+            "full_exits": len(full_trades),
             "win_rate": round(win_rate, 4),
             "profit_factor": round(profit_factor, 4),
             "sharpe_ratio": round(sharpe, 4),
             "max_drawdown_pct": round(max_dd, 4),
-            "total_pnl": round(sum(pnls), 2),
+            "total_pnl": round(sum(all_pnls), 2),
             "avg_win": round(avg_win, 2),
             "avg_loss": round(avg_loss, 2),
             "expectancy": round(expectancy, 2),
@@ -138,6 +144,11 @@ class MetricsTracker:
         with self._lock:
             trades = list(self._trades)
 
+        if not trades:
+            return {}
+
+        # Exclude partial closes from regime stats (same reason as compute_stats)
+        trades = [t for t in trades if not t.is_partial]
         if not trades:
             return {}
 

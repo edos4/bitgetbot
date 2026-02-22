@@ -139,6 +139,9 @@ class TradingConfig:
     min_stop_atr_multiple: float = 1.5        # Stop distance ≥ 1.5×ATR (prevents noise-level stops)
     rsi_momentum_long_min: float = 55.0       # TREND_PULLBACK LONG in TRENDING: RSI must be > this (momentum confirm)
     btc_gate_min_correlation: float = 0.6     # BTC EMA gate only applies if symbol’s correlation to BTC ≥ this; low-corr alts are exempt
+    trend_pullback_trending_min_conf: float = 0.70  # TREND_PULLBACK in TRENDING regime requires higher confidence (4 sessions -PF; raise bar)
+    min_signal_confidence_ranging: float = 0.40     # RANGING regime uses a lower confidence floor (MEAN_REVERSION/MOMENTUM_BREAKOUT)
+    rs_exit_drop_threshold: float = 0.40      # Close position if symbol RS drops > this from entry-time RS (momentum collapse)
     min_order_notional_usdt: float = 5.1      # Bitget minimum order value (rejects silently below this)
     min_signal_confidence: float = 0.45       # Reject signals below this confidence; conf=0.32 is noise territory on 1m
     # ---- Expected Value (EV) Filter ----

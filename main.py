@@ -318,6 +318,8 @@ class TradingEngine:
                 trades_placed += 1
                 pos = self._portfolio.get_position(sym)
                 if pos:
+                    # Store entry-time RS score for deterioration exit tracking
+                    pos.entry_rs_score = score.rs_btc_score
                     unrealized = pos.unrealized_pnl
                     position_cost = pos.entry_price * pos.quantity + 1e-10
                     pnl_pct = (unrealized / position_cost) * 100
@@ -398,6 +400,7 @@ class TradingEngine:
                         stop_loss=pos.stop_loss, take_profit=pos.take_profit,
                         strategy=pos.strategy, confidence=pos.signal_confidence,
                         kelly_fraction=pos.kelly_fraction,
+                        is_partial=True,
                     )
                     self._metrics.record_trade(rec)
                     self._notifier.trade_closed(
@@ -411,6 +414,20 @@ class TradingEngine:
 
             # 3. Time-based stagnant exit
             self._executor.check_time_based_exit(sym, price)
+
+            # 4. RS deterioration exit: if symbol RS has dropped > threshold from entry, close
+            # Catches momentum collapse (e.g. PIPPIN rs:0.70 -> rs:0.13 in same session)
+            if pos.entry_rs_score > 0:
+                current_score = self._scanner.get_score(sym)
+                if current_score is not None:
+                    rs_drop = pos.entry_rs_score - current_score.rs_btc_score
+                    if rs_drop > self._cfg.trading.rs_exit_drop_threshold:
+                        log.warning(
+                            "⚠️  RS deterioration exit [%s]: entry_rs=%.2f current_rs=%.2f drop=%.2f (threshold=%.2f)",
+                            sym, pos.entry_rs_score, current_score.rs_btc_score,
+                            rs_drop, self._cfg.trading.rs_exit_drop_threshold,
+                        )
+                        self._executor.close_position(sym, price, "RS_DETERIORATION")
 
     def _check_exits(self) -> None:
         """Check all open positions for stop/target hits."""
