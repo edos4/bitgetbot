@@ -306,13 +306,13 @@ class TradingEngine:
                     and sym != "BTCUSDT"
                     and not btc_bullish):
                 btc_corr = self._portfolio.get_btc_correlation(sym)
-                if btc_corr >= self._cfg.btc_gate_min_correlation:
+                if btc_corr >= self._cfg.trading.btc_gate_min_correlation:
                     if trace_enabled:
                         log.info("TRACE %s: LONG blocked — BTC EMA bearish (gate, corr=%.2f)", sym, btc_corr)
                     continue
                 else:
                     if trace_enabled:
-                        log.info("TRACE %s: BTC gate bypassed — low BTC corr=%.2f < %.2f", sym, btc_corr, self._cfg.btc_gate_min_correlation)
+                        log.info("TRACE %s: BTC gate bypassed — low BTC corr=%.2f < %.2f", sym, btc_corr, self._cfg.trading.btc_gate_min_correlation)
             placed = self._executor.execute_signal(signal, equity, current_prices)
             if placed:
                 trades_placed += 1
