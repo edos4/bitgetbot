@@ -51,10 +51,14 @@ class StrategyStats:
         max_dd = self._compute_drawdown()
         return StrategySnapshot(win_rate, avg_r, expectancy, profit_factor, sharpe, max_dd, sample)
 
-    def kelly_fraction(self, reward_risk_ratio: float, min_sample: int = 10) -> float:
+    def kelly_fraction(self, reward_risk_ratio: float, min_sample: int = 20) -> float:
         cfg = get_config().trading
         snap = self.snapshot()
-        p = snap.win_rate if snap.sample_size >= min_sample else 0.5
+        if snap.sample_size < min_sample:
+            # Insufficient history — fall back to conservative 50% win-rate assumption
+            p = 0.50
+        else:
+            p = snap.win_rate
         b = max(reward_risk_ratio, 0.01)
         q = 1 - p
         f_star = (b * p - q) / b

@@ -78,7 +78,7 @@ class PortfolioManager:
         with self._lock:
             self._positions[pos.symbol] = pos
         risk_usd = abs(pos.entry_price - pos.stop_loss) * pos.quantity
-        self._risk.register_trade_open(pos.symbol, risk_usd)
+        self._risk.register_trade_open(pos.symbol, risk_usd, direction=pos.direction.value)
         log.info("Position opened: %s %s @ %.4f qty=%.4f stop=%.4f",
                  pos.symbol, pos.direction.value, pos.entry_price, pos.quantity, pos.stop_loss)
 
@@ -222,6 +222,11 @@ class PortfolioManager:
     def get_total_unrealized_pnl(self) -> float:
         with self._lock:
             return sum(p.unrealized_pnl for p in self._positions.values())
+
+    def get_total_notional(self) -> float:
+        """Sum of abs(entry_price * quantity) across all open positions."""
+        with self._lock:
+            return sum(abs(p.entry_price * p.quantity) for p in self._positions.values())
 
     def get_max_correlation(self, symbol: str) -> float:
         with self._lock:

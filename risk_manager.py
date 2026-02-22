@@ -55,6 +55,11 @@ class RiskManager:
         # Per-base-asset risk: base ("BTC", "ETH") → $ at risk across all correlated pairs
         self._base_risk: Dict[str, float] = {}
 
+        # Directional exposure: long / short $ at risk
+        self._long_risk: float = 0.0
+        self._short_risk: float = 0.0
+        self._trade_directions: Dict[str, str] = {}  # symbol → "LONG" | "SHORT"
+
         # Blocked symbols
         self._blocked_symbols: set[str] = set()
 
@@ -68,6 +73,7 @@ class RiskManager:
         requested_risk_fraction: float,
         current_equity: float,
         existing_positions: List[str],
+        direction: str = "LONG",
     ) -> RiskDecision:
         """
         Full pre-trade risk check.
@@ -83,6 +89,18 @@ class RiskManager:
             # 2. Max concurrent positions
             if len(existing_positions) >= self._cfg.max_concurrent_positions:
                 return RiskDecision(False, f"Max concurrent positions reached ({self._cfg.max_concurrent_positions})")
+
+            # 2b. Same-direction count cap: prevent LONG or SHORT stack beyond N positions
+            #     Directional stacking causes all positions to move against you simultaneously
+            #     on micro-reversals — this is the structural cause of correlated drawdown.
+            dir_upper = direction.upper()
+            same_dir_open = sum(1 for d in self._trade_directions.values() if d == dir_upper)
+            if same_dir_open >= self._cfg.max_same_direction_positions:
+                return RiskDecision(
+                    False,
+                    f"Same-direction cap hit: {same_dir_open} {dir_upper} positions already open "
+                    f"(max={self._cfg.max_same_direction_positions})",
+                )
 
             # 3. Daily loss cutoff
             daily_loss_pct = -self._daily_pnl / (self._starting_equity + 1e-10)
@@ -146,6 +164,27 @@ class RiskManager:
             if risk_fraction < 0.001:
                 return RiskDecision(False, "Scaled risk fraction too small after base-cap adjustment (<0.1%)")
 
+            # 7. Directional exposure cap: limit long and short side independently
+            current_dir_risk = self._long_risk if dir_upper == "LONG" else self._short_risk
+            dir_cap = self._cfg.max_directional_exposure_pct * current_equity
+            if current_dir_risk + risk_dollar > dir_cap:
+                available_dir = dir_cap - current_dir_risk
+                if available_dir <= 0:
+                    return RiskDecision(
+                        False,
+                        f"Directional cap hit ({dir_upper}): "
+                        f"{current_dir_risk/current_equity:.1%} ≥ {self._cfg.max_directional_exposure_pct:.1%}",
+                    )
+                log.info(
+                    "Directional cap sizing down %s (%s): $%.2f → $%.2f",
+                    symbol, dir_upper, risk_dollar, available_dir,
+                )
+                risk_dollar = available_dir
+                risk_fraction = risk_dollar / (current_equity + 1e-10)
+
+            if risk_fraction < 0.001:
+                return RiskDecision(False, "Scaled risk fraction too small after directional-cap adjustment (<0.1%)")
+
             heat_pct = (total_heat + risk_dollar) / (current_equity + 1e-10)
             log.info(
                 "Risk OK: %s | heat=%.1f%% | base_risk(%s)=%.1f%% | consc_losses=%d",
@@ -166,11 +205,17 @@ class RiskManager:
     # State updates
     # ------------------------------------------------------------------ #
 
-    def register_trade_open(self, symbol: str, risk_usd: float) -> None:
+    def register_trade_open(self, symbol: str, risk_usd: float, direction: str = "LONG") -> None:
         with self._lock:
             self._active_risk[symbol] = risk_usd
             base = _base_asset(symbol)
             self._base_risk[base] = self._base_risk.get(base, 0.0) + risk_usd
+            dir_upper = direction.upper()
+            self._trade_directions[symbol] = dir_upper
+            if dir_upper == "LONG":
+                self._long_risk += risk_usd
+            else:
+                self._short_risk += risk_usd
 
     def register_trade_close(self, symbol: str, pnl: float, exit_reason: str = "") -> None:
         with self._lock:
@@ -178,6 +223,12 @@ class RiskManager:
             # Remove from per-base tracker
             base = _base_asset(symbol)
             self._base_risk[base] = max(0.0, self._base_risk.get(base, 0.0) - risk)
+            # Remove from directional tracker
+            dir_upper = self._trade_directions.pop(symbol, "LONG")
+            if dir_upper == "LONG":
+                self._long_risk = max(0.0, self._long_risk - risk)
+            else:
+                self._short_risk = max(0.0, self._short_risk - risk)
             self._daily_pnl += pnl
             # SHUTDOWN closes are forced exits, not a strategy failure — skip streak counter
             if exit_reason.upper() == "SHUTDOWN":
@@ -236,3 +287,8 @@ class RiskManager:
     def get_consecutive_losses(self) -> int:
         with self._lock:
             return self._consecutive_losses
+
+    def get_direction_count(self, direction: str) -> int:
+        """Return number of currently open positions in the given direction ('LONG' or 'SHORT')."""
+        with self._lock:
+            return sum(1 for d in self._trade_directions.values() if d == direction.upper())

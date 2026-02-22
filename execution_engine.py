@@ -2,7 +2,7 @@
 import time
 import threading
 from collections import deque
-from typing import Optional
+from typing import Dict, Optional
 
 from config import get_config
 from strategy import Signal, SignalDirection
@@ -32,6 +32,8 @@ class ExecutionEngine:
         self._mode = self._cfg.mode
         self._lock = threading.Lock()
         self._recent_trades = deque()
+        self._symbol_last_trade: Dict[str, float] = {}  # symbol → epoch of last fill
+        self._trades_this_cycle: int = 0               # counter reset at start of each scan cycle
         self._stats = stats_manager or StrategyStatsManager()
         log.info("ExecutionEngine initialized in %s mode", self._mode.upper())
 
@@ -48,12 +50,60 @@ class ExecutionEngine:
             log.debug("Skip %s — position already open", signal.symbol)
             return False
 
-        if not self._can_trade_now():
-            log.info("❌ Trade blocked [%s]: trade frequency cap hit", signal.symbol)
+        # --- Hard signal validation ---
+        # 1. Absolute price floor: sub-cent tokens (PEPE, SHIB-class) cause float precision
+        #    errors: billions of tokens, ATR rounds to 0, stop collapses to entry.
+        if signal.entry_price < self._cfg.min_entry_price:
+            log.warning(
+                "❌ Trade rejected [%s]: entry_price=%.10f below min_entry_price=%.6f "
+                "(sub-cent token — float precision risk)",
+                signal.symbol, signal.entry_price, self._cfg.min_entry_price,
+            )
+            return False
+        if signal.stop_loss <= 0:
+            log.warning("❌ Trade rejected [%s]: stop_loss=%.10f ≤ 0", signal.symbol, signal.stop_loss)
             return False
 
-        if signal.stop_distance <= 0:
-            log.warning("Stop distance invalid for %s — skip", signal.symbol)
+        # 2. ATR must be ≥ 0.1% of entry price — prevents division-by-zero and trivial sizing
+        min_atr_abs = signal.entry_price * self._cfg.min_atr_fraction
+        if signal.atr <= 0 or signal.atr < min_atr_abs:
+            log.warning(
+                "❌ Trade rejected [%s]: ATR=%.10f below min (%.10f = %.3f%% of price)",
+                signal.symbol, signal.atr, min_atr_abs, self._cfg.min_atr_fraction * 100,
+            )
+            return False
+
+        # 3. Stop distance must be ≥ 1.5× ATR — ensures stop is not within intrabar noise.
+        #    Price-% floor removed: 0.07% of BTC ($47) blocked valid $24 stops where ATR×1.5 was satisfied.
+        min_stop_by_atr = signal.atr * self._cfg.min_stop_atr_multiple
+        if signal.stop_distance < min_stop_by_atr:
+            log.warning(
+                "❌ Trade rejected [%s]: stop_distance=%.10f below ATR×%.1f=%.10f",
+                signal.symbol, signal.stop_distance,
+                self._cfg.min_stop_atr_multiple, min_stop_by_atr,
+            )
+            return False
+
+        # Per-cycle burst guard: limit new entries within a single scan cycle
+        max_per_cycle = self._cfg.max_new_trades_per_cycle
+        if self._trades_this_cycle >= max_per_cycle:
+            log.info(
+                "❌ Trade blocked [%s]: per-cycle cap hit (%d/%d trades this cycle)",
+                signal.symbol, self._trades_this_cycle, max_per_cycle,
+            )
+            return False
+
+        if not self._can_trade_now():
+            log.info("❌ Trade blocked [%s]: global trade frequency cap hit", signal.symbol)
+            return False
+
+        # --- Per-symbol cooldown: prevent re-entry within symbol_cooldown_seconds ---
+        cooldown = self._cfg.symbol_cooldown_seconds
+        now = time.time()
+        last = self._symbol_last_trade.get(signal.symbol, 0.0)
+        if now - last < cooldown:
+            remaining = int(cooldown - (now - last))
+            log.info("❌ Trade blocked [%s]: symbol on cooldown (%ds remaining)", signal.symbol, remaining)
             return False
 
         reward_risk = max(signal.reward_risk_ratio, 0.01)
@@ -63,6 +113,16 @@ class ExecutionEngine:
             return False
 
         risk_fraction = min(base_fraction, self._cfg.max_risk_per_trade_pct)
+
+        # Regime-behavioral risk scalar — regime is now an active sizing variable
+        # TRENDING:        ×1.0  (full size — trend signals have best edge)
+        # RANGING:         ×0.8  (mean-reversion on 1m has higher false-positive rate)
+        # HIGH_VOLATILITY: ×0.5  (confirmed via confidence×0.5 already, but enforce here too)
+        _REGIME_SCALARS = {"TRENDING": 1.0, "RANGING": 0.8, "HIGH_VOLATILITY": 0.5}
+        regime_scalar = _REGIME_SCALARS.get(signal.regime.value, 1.0)
+        if regime_scalar < 1.0:
+            log.debug("Regime risk scalar [%s]: %s ×%.1f", signal.symbol, signal.regime.value, regime_scalar)
+        risk_fraction *= regime_scalar
 
         # --- Tiered volume-ratio position sizing ---
         # signal.volume_ratio = current_vol / rolling_avg_vol (set by strategy)
@@ -92,8 +152,59 @@ class ExecutionEngine:
             reduction = max(0.0, 1 - (corr_value - self._cfg.correlation_threshold) / (1 - self._cfg.correlation_threshold + 1e-10))
             risk_fraction *= reduction
 
+        # Directional clustering penalty: same-direction + high correlation → halve risk
+        if corr_value > self._cfg.directional_corr_penalty_threshold:
+            open_positions = self._portfolio.get_all_positions()
+            corr_row = self._portfolio._correlations.get(signal.symbol, {})
+            same_dir_correlated = any(
+                abs(corr_row.get(sym, 0.0)) > self._cfg.directional_corr_penalty_threshold
+                and pos.direction == signal.direction
+                for sym, pos in open_positions.items()
+            )
+            if same_dir_correlated:
+                risk_fraction *= 0.5
+                log.info(
+                    "⚠ Same-direction cluster [%s] corr=%.2f %s: risk halved",
+                    signal.symbol, corr_value, signal.direction.value,
+                )
+
         if signal.atr_ratio > self._cfg.atr_volatility_multiplier:
             risk_fraction *= 0.5
+
+        # ATR compression: low atr_ratio = compressed market = high false-signal probability
+        # atr_ratio < 0.7 means current ATR is well below its rolling median → regime noise
+        if 0 < signal.atr_ratio < self._cfg.atr_compression_ratio:
+            risk_fraction *= 0.5
+            log.debug(
+                "ATR compression [%s]: atr_ratio=%.2f < %.2f → risk halved",
+                signal.symbol, signal.atr_ratio, self._cfg.atr_compression_ratio,
+            )
+
+        # Same-direction decay: each additional open position in the same direction
+        # tapers the new entry's risk by same_direction_risk_decay per existing position.
+        # 0 existing same-dir → ×1.0;  1 existing → ×0.5;  2 → blocked upstream by risk_manager
+        same_dir_count = self._risk.get_direction_count(signal.direction.value)
+        if same_dir_count >= 1:
+            decay = self._cfg.same_direction_risk_decay ** same_dir_count
+            risk_fraction *= decay
+            log.info(
+                "⚠ Same-direction decay [%s]: %d %s open → risk ×%.2f",
+                signal.symbol, same_dir_count, signal.direction.value, decay,
+            )
+        # Only enforce once strategy has min_ev_sample closed trades.
+        # EV = RR × win_rate − (1 − win_rate)
+        stats_snapshot = self._stats.get_snapshot(signal.strategy)
+        if stats_snapshot.sample_size >= self._cfg.min_ev_sample:
+            ev = reward_risk * stats_snapshot.win_rate - (1.0 - stats_snapshot.win_rate)
+            if ev <= self._cfg.min_ev_threshold:
+                log.info(
+                    "❌ Trade blocked [%s]: EV=%.3f ≤ threshold=%.2f "
+                    "(strat=%s win_rate=%.0f%% n=%d rr=%.2f)",
+                    signal.symbol, ev, self._cfg.min_ev_threshold,
+                    signal.strategy, stats_snapshot.win_rate * 100,
+                    stats_snapshot.sample_size, reward_risk,
+                )
+                return False
 
         existing_syms = self._portfolio.get_open_symbols()
 
@@ -102,6 +213,7 @@ class ExecutionEngine:
             requested_risk_fraction=risk_fraction,
             current_equity=equity,
             existing_positions=existing_syms,
+            direction=signal.direction.value,
         )
 
         if not decision.approved:
@@ -116,11 +228,56 @@ class ExecutionEngine:
             return False
 
         notional_usd = qty * signal.entry_price
+
+        # Bitget minimum order value: 5.1 USDT (exchange silently rejects below this)
+        if notional_usd < self._cfg.min_order_notional_usdt:
+            log.info(
+                "❌ Trade blocked [%s]: notional=$%.2f below Bitget min=$%.1f",
+                signal.symbol, notional_usd, self._cfg.min_order_notional_usdt,
+            )
+            return False
+
+        # Hard per-trade notional cap: ≤ equity × max_notional_per_trade_x
+        max_per_trade_notional = equity * self._cfg.max_notional_per_trade_x
+        if notional_usd > max_per_trade_notional:
+            qty = max_per_trade_notional / (signal.entry_price + 1e-10)
+            notional_usd = qty * signal.entry_price
+            risk_dollar = qty * signal.stop_distance
+            effective_fraction = risk_dollar / (equity + 1e-10)
+            log.info(
+                "Notional cap applied [%s]: capped at $%.0f (%.1f× equity)",
+                signal.symbol, max_per_trade_notional, self._cfg.max_notional_per_trade_x,
+            )
+
+        # Hard total notional cap: total portfolio notional ≤ equity × max_total_notional_x
+        total_notional = self._portfolio.get_total_notional()
+        max_total_notional = equity * self._cfg.max_total_notional_x
+        if total_notional + notional_usd > max_total_notional:
+            remaining_notional = max_total_notional - total_notional
+            if remaining_notional <= 0:
+                log.info(
+                    "❌ Trade blocked [%s]: total notional cap hit ($%.0f / $%.0f)",
+                    signal.symbol, total_notional, max_total_notional,
+                )
+                return False
+            qty = remaining_notional / (signal.entry_price + 1e-10)
+            notional_usd = remaining_notional
+            risk_dollar = qty * signal.stop_distance
+            effective_fraction = risk_dollar / (equity + 1e-10)
+            log.info(
+                "Total notional cap sizing down [%s]: $%.0f → $%.0f",
+                signal.symbol, total_notional + notional_usd, max_total_notional,
+            )
+
+        if qty <= 0:
+            log.info("❌ Trade blocked [%s]: zero quantity after notional cap", signal.symbol)
+            return False
+
         if self._portfolio.breaches_variance_cap(notional_usd, signal.entry_price, signal.atr):
             log.info("❌ Trade blocked [%s]: portfolio variance cap exceeded", signal.symbol)
             return False
 
-        stats_snapshot = self._stats.get_snapshot(signal.strategy)
+        # stats_snapshot already computed above for EV filter; reuse here
         expected_value = reward_risk * stats_snapshot.win_rate - (1 - stats_snapshot.win_rate)
         portfolio_heat = self._risk.get_portfolio_heat(equity)
 
@@ -148,7 +305,10 @@ class ExecutionEngine:
 
         success = self._place_order(signal, qty, decision.leverage, risk_dollar, effective_fraction)
         if success:
-            self._recent_trades.append(time.time())
+            now_ts = time.time()
+            self._recent_trades.append(now_ts)
+            self._symbol_last_trade[signal.symbol] = now_ts
+            self._trades_this_cycle += 1
         return success
 
     def partial_close_position(
@@ -253,27 +413,36 @@ class ExecutionEngine:
             )
             return self.close_position(symbol, current_price, "TIME_EXIT")
         return False
+
+    def close_position(
+        self,
+        symbol: str,
+        current_price: float,
+        reason: str = "MANUAL",
+    ) -> bool:
+        """Close an open position at the current market price."""
         pos = self._portfolio.get_position(symbol)
         if not pos:
             return False
 
         log.info("Closing %s @ %.4f | reason=%s", symbol, current_price, reason)
 
-        if self._mode == "paper":
-            fill = (
-                self._paper.market_sell(symbol, pos.quantity, current_price)
-                if pos.direction == SignalDirection.LONG
-                else self._paper.market_buy(symbol, pos.quantity, current_price)
-            )
+        if self._mode == "paper" and self._paper:
             if pos.direction == SignalDirection.LONG:
+                fill = self._paper.market_sell(symbol, pos.quantity, current_price)
                 pnl = (fill.fill_price - pos.entry_price) * pos.quantity
             else:
+                fill = self._paper.market_buy(symbol, pos.quantity, current_price)
                 pnl = (pos.entry_price - fill.fill_price) * pos.quantity
-            self._paper.record_trade_pnl(pnl, fill.fee_paid)
-        else:
+            # fee_paid already subtracted in paper engine's record_trade_pnl
+            self._paper.record_trade_pnl(pnl - fill.fee_paid, 0.0)
+        elif self._mode == "live":
             self._live_close(pos, current_price)
 
         self._portfolio.close_position(symbol, current_price, reason)
+        # Reset cooldown from close time so symbol can't re-enter immediately after a stop
+        if reason in ("STOP_LOSS", "STAGNANT"):
+            self._symbol_last_trade[symbol] = time.time()
         return True
 
     def _place_order(self, signal: Signal, quantity: float, leverage: int, risk_dollar: float, risk_fraction: float) -> bool:
@@ -349,6 +518,9 @@ class ExecutionEngine:
 
         side = "buy" if signal.direction == SignalDirection.LONG else "sell"
         trade_side = "open"
+        # holdSide selects which leg of the hedge position to open (passivbot pattern)
+        # open + buy  → long leg;  open + sell → short leg
+        hold_side = "long" if signal.direction == SignalDirection.LONG else "short"
         client_oid = f"te_{signal.symbol[:6]}_{int(time.time())}"
 
         for attempt in range(self._cfg.order_retry_attempts):
@@ -360,9 +532,10 @@ class ExecutionEngine:
                     order_type="market",
                     size=qty,
                     client_oid=client_oid,
+                    hold_side=hold_side,
                 )
                 order_id = result.get("orderId")
-                log.info("Live order placed: %s orderId=%s", signal.symbol, order_id)
+                log.info("Live order placed: %s orderId=%s holdSide=%s", signal.symbol, order_id, hold_side)
 
                 pos = Position(
                     symbol=signal.symbol,
@@ -390,7 +563,7 @@ class ExecutionEngine:
                     self._rest.place_stop_order(
                         symbol=signal.symbol,
                         plan_type="loss_plan",
-                        side="sell" if signal.direction == SignalDirection.LONG else "buy",
+                        position_direction=signal.direction.value,  # "LONG" | "SHORT"
                         size=qty,
                         trigger_price=signal.stop_loss,
                     )
@@ -409,7 +582,10 @@ class ExecutionEngine:
     def _live_close(self, pos: Position, price: float) -> None:
         if not self._rest:
             return
+        # Closing a LONG = sell the long leg;  closing a SHORT = buy the short leg
+        # holdSide must match the position being closed (passivbot pattern)
         side = "sell" if pos.direction == SignalDirection.LONG else "buy"
+        hold_side = "long" if pos.direction == SignalDirection.LONG else "short"
         for attempt in range(self._cfg.order_retry_attempts):
             try:
                 self._rest.place_order(
@@ -418,11 +594,16 @@ class ExecutionEngine:
                     trade_side="close",
                     order_type="market",
                     size=pos.quantity,
+                    hold_side=hold_side,
                 )
                 return
             except Exception as e:
                 log.error("Close attempt %d failed for %s: %s", attempt + 1, pos.symbol, e)
                 time.sleep(self._cfg.order_retry_delay_seconds)
+
+    def reset_cycle_counter(self) -> None:
+        """Call at the start of each scan cycle to reset the per-cycle trade limit."""
+        self._trades_this_cycle = 0
 
     def _can_trade_now(self) -> bool:
         window_seconds = self._cfg.trade_frequency_window_seconds

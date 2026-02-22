@@ -91,6 +91,11 @@ class IndicatorCache:
         self.high_n: Optional[pd.Series] = None      # N-bar rolling high, shifted to avoid lookahead
         self.low_n: Optional[pd.Series] = None       # N-bar rolling low, shifted
         self.raw_vol_ratio: Optional[pd.Series] = None  # current_vol / rolling_avg_vol
+        # Momentum breakout indicators
+        self.rsi: Optional[pd.Series] = None          # RSI(rsi_period)
+        self.donchian_high: Optional[pd.Series] = None  # Donchian channel high, shifted
+        self.donchian_low: Optional[pd.Series] = None   # Donchian channel low, shifted
+        self.atr_pct_rank: Optional[pd.Series] = None   # ATR rolling percentile rank [0,1]
 
     @classmethod
     def from_df(cls, df: pd.DataFrame) -> "IndicatorCache":
@@ -132,6 +137,19 @@ class IndicatorCache:
         raw_vol = df["volume"]
         avg_vol = raw_vol.rolling(cfg.volume_lookback).mean()
         obj.raw_vol_ratio = raw_vol / (avg_vol + 1e-10)
+
+        # RSI
+        rsi_ind = ta.momentum.RSIIndicator(close=close, window=cfg.rsi_period)
+        obj.rsi = rsi_ind.rsi()
+
+        # Donchian channel for momentum breakout (lookahead-free: shift 1)
+        d = cfg.donchian_period
+        obj.donchian_high = df["high"].rolling(d).max().shift(1)
+        obj.donchian_low  = df["low"].rolling(d).min().shift(1)
+
+        # ATR rolling percentile rank — values in [0, 1]
+        atr_comp_window = cfg.atr_compression_lookback
+        obj.atr_pct_rank = obj.atr.rolling(atr_comp_window).rank(pct=True)
 
         return obj
 
@@ -189,6 +207,34 @@ class IndicatorCache:
             return 1.0
         v = self.raw_vol_ratio.iloc[idx]
         return float(v) if not pd.isna(v) else 1.0
+
+    def get_rsi(self, idx: int) -> float:
+        """Return RSI value at idx; defaults to 50 (neutral) if unavailable."""
+        if self.rsi is None:
+            return 50.0
+        v = self.rsi.iloc[idx]
+        return float(v) if not pd.isna(v) else 50.0
+
+    def get_donchian_high(self, idx: int) -> Optional[float]:
+        """Donchian channel high at idx (lookahead-free, shifted 1 bar)."""
+        if self.donchian_high is None:
+            return None
+        v = self.donchian_high.iloc[idx]
+        return None if pd.isna(v) else float(v)
+
+    def get_donchian_low(self, idx: int) -> Optional[float]:
+        """Donchian channel low at idx (lookahead-free, shifted 1 bar)."""
+        if self.donchian_low is None:
+            return None
+        v = self.donchian_low.iloc[idx]
+        return None if pd.isna(v) else float(v)
+
+    def get_atr_pct_rank(self, idx: int) -> float:
+        """Rolling ATR percentile rank in [0, 1]. 0=compressed, 1=extremely expanded."""
+        if self.atr_pct_rank is None:
+            return 0.5
+        v = self.atr_pct_rank.iloc[idx]
+        return float(v) if not pd.isna(v) else 0.5
 
     def volume_size_factor(self, idx: int) -> float:
         """Map volume_ratio to a position-size multiplier.
@@ -474,6 +520,36 @@ class ConfidenceScorer:
                  w[3]*align_f + w[4]*vol_state_f)
         return float(min(1.0, max(0.0, score)))
 
+    @staticmethod
+    def momentum_breakout(
+        rsi: float,
+        breakout_dist: float,
+        atr: float,
+        regime_state: RegimeState,
+        vol_ratio: float,
+        ema_f: Optional[float],
+        ema_s: Optional[float],
+    ) -> float:
+        """5-factor confidence for Donchian momentum breakout signals."""
+        w = ConfidenceScorer._weights()
+        # 1. Signal strength: RSI distance from 50 (momentum strength)
+        signal_f = min(1.0, abs(rsi - 50.0) / 50.0)
+        # 2. Regime: expanding ATR or strong trend boosts momentum signals
+        regime_f = min(1.0, (regime_state.trend_score + regime_state.atr_ratio * 0.5) / 1.5)
+        # 3. Volume
+        vol_f = min(1.0, vol_ratio / 3.0)
+        # 4. EMA alignment: fast above/below slow adds directional conviction
+        if ema_f is not None and ema_s is not None and atr > 0:
+            align_f = min(1.0, abs(ema_f - ema_s) / (2.0 * atr + 1e-10))
+        else:
+            align_f = 0.3
+        # 5. Volatility state: moderately expanding ATR is best for breakouts
+        atr_r = regime_state.atr_ratio
+        vol_state_f = min(1.0, max(0.0, (atr_r - 0.8) / 1.0))
+        score = (w[0]*signal_f + w[1]*regime_f + w[2]*vol_f +
+                 w[3]*align_f + w[4]*vol_state_f)
+        return float(min(1.0, max(0.0, score)))
+
 
 # ---------------------------------------------------------------------------
 # Volatility Breakout strategy (HIGH_VOLATILITY regime)
@@ -619,6 +695,161 @@ def _compute_vol_ratio(df: pd.DataFrame, lookback: int = 20) -> float:
     return last_vol / (avg_vol + 1e-10)
 
 
+def _compute_rsi_last(df: pd.DataFrame, period: int = 14) -> float:
+    """Compute the last RSI value for the live/paper signal path."""
+    if len(df) < period + 5:
+        return 50.0
+    try:
+        rsi_ind = ta.momentum.RSIIndicator(close=df["close"], window=period)
+        s = rsi_ind.rsi()
+        if s.empty:
+            return 50.0
+        v = s.iloc[-1]
+        return float(v) if not pd.isna(v) else 50.0
+    except Exception:
+        return 50.0
+
+
+# ---------------------------------------------------------------------------
+# Momentum Breakout strategy (TRENDING + RANGING regimes)
+# Donchian channel breakout with RSI momentum confirmation
+# ---------------------------------------------------------------------------
+
+def _momentum_breakout_from_cache(
+    symbol: str,
+    cache: "IndicatorCache",
+    idx: int,
+    price: float,
+    atr: float,
+    regime_state: RegimeState,
+) -> Signal:
+    """Donchian channel breakout with RSI confirmation — cache path."""
+    cfg = get_config().trading
+
+    d_high = cache.get_donchian_high(idx)
+    d_low  = cache.get_donchian_low(idx)
+    if d_high is None or d_low is None:
+        return _no_signal(symbol, price, atr, regime_state.primary,
+                          "DONCHIAN_NOT_READY", "MOMENTUM_BREAKOUT", regime_state.atr_ratio)
+
+    vol_ratio = cache.get_raw_vol_ratio(idx)
+    if vol_ratio < cfg.volume_ratio_min:
+        return _no_signal(symbol, price, atr, regime_state.primary,
+                          f"VOL_RATIO_LOW({vol_ratio:.2f})", "MOMENTUM_BREAKOUT", regime_state.atr_ratio)
+
+    rsi = cache.get_rsi(idx)
+    ema_f = cache.get_ema_fast(idx)
+    ema_s = cache.get_ema_slow(idx)
+
+    direction = SignalDirection.NONE
+    breakout_dist = 0.0
+
+    if price > d_high and rsi > cfg.momentum_rsi_long:
+        direction = SignalDirection.LONG
+        breakout_dist = price - d_high
+    elif price < d_low and rsi < cfg.momentum_rsi_short:
+        direction = SignalDirection.SHORT
+        breakout_dist = d_low - price
+
+    if direction == SignalDirection.NONE:
+        reason = (
+            f"NO_BREAKOUT(p={price:.4f},h={d_high:.4f},l={d_low:.4f},rsi={rsi:.1f})"
+        )
+        return _no_signal(symbol, price, atr, regime_state.primary,
+                          reason, "MOMENTUM_BREAKOUT", regime_state.atr_ratio)
+
+    stop_distance = atr * cfg.donchian_atr_stop_multiplier
+    reward_risk   = cfg.donchian_rr
+
+    if direction == SignalDirection.LONG:
+        stop   = price - stop_distance
+        target = price + stop_distance * reward_risk
+    else:
+        stop   = price + stop_distance
+        target = price - stop_distance * reward_risk
+
+    confidence = ConfidenceScorer.momentum_breakout(
+        rsi, breakout_dist, atr, regime_state, vol_ratio, ema_f, ema_s
+    )
+
+    return Signal(
+        symbol=symbol, direction=direction, entry_price=price,
+        stop_loss=stop, take_profit=target, regime=regime_state.primary,
+        stop_distance=stop_distance, reward_risk_ratio=reward_risk, atr=atr,
+        reason=f"MOMENTUM_BREAKOUT({'LONG' if direction == SignalDirection.LONG else 'SHORT'})",
+        strategy="MOMENTUM_BREAKOUT", atr_ratio=regime_state.atr_ratio,
+        confidence=confidence, volume_ratio=vol_ratio,
+    )
+
+
+def _momentum_breakout_signal(
+    symbol: str,
+    df: pd.DataFrame,
+    price: float,
+    atr: float,
+    regime_state: RegimeState,
+) -> Signal:
+    """Momentum breakout strategy for the live/paper path."""
+    cfg = get_config().trading
+    n = cfg.donchian_period
+    if len(df) < n + 5:
+        return _no_signal(symbol, price, atr, regime_state.primary,
+                          "NOT_ENOUGH_BARS", "MOMENTUM_BREAKOUT", regime_state.atr_ratio)
+
+    d_high = float(df["high"].iloc[-(n + 1):-1].max())
+    d_low  = float(df["low"].iloc[-(n + 1):-1].min())
+
+    vol_ratio = _compute_vol_ratio(df, lookback=cfg.volume_lookback)
+    if vol_ratio < cfg.volume_ratio_min:
+        return _no_signal(symbol, price, atr, regime_state.primary,
+                          f"VOL_RATIO_LOW({vol_ratio:.2f})", "MOMENTUM_BREAKOUT", regime_state.atr_ratio)
+
+    rsi = _compute_rsi_last(df, period=cfg.rsi_period)
+    close = df["close"]
+    ema_fast_s = ta.trend.EMAIndicator(close=close, window=cfg.ema_fast).ema_indicator()
+    ema_slow_s = ta.trend.EMAIndicator(close=close, window=cfg.ema_slow).ema_indicator()
+    ema_f = float(ema_fast_s.iloc[-1]) if not ema_fast_s.empty else None
+    ema_s = float(ema_slow_s.iloc[-1]) if not ema_slow_s.empty else None
+
+    direction = SignalDirection.NONE
+    breakout_dist = 0.0
+
+    if price > d_high and rsi > cfg.momentum_rsi_long:
+        direction = SignalDirection.LONG
+        breakout_dist = price - d_high
+    elif price < d_low and rsi < cfg.momentum_rsi_short:
+        direction = SignalDirection.SHORT
+        breakout_dist = d_low - price
+
+    if direction == SignalDirection.NONE:
+        reason = f"NO_BREAKOUT(p={price:.4f},h={d_high:.4f},l={d_low:.4f},rsi={rsi:.1f})"
+        return _no_signal(symbol, price, atr, regime_state.primary,
+                          reason, "MOMENTUM_BREAKOUT", regime_state.atr_ratio)
+
+    stop_distance = atr * cfg.donchian_atr_stop_multiplier
+    reward_risk   = cfg.donchian_rr
+
+    if direction == SignalDirection.LONG:
+        stop   = price - stop_distance
+        target = price + stop_distance * reward_risk
+    else:
+        stop   = price + stop_distance
+        target = price - stop_distance * reward_risk
+
+    confidence = ConfidenceScorer.momentum_breakout(
+        rsi, breakout_dist, atr, regime_state, vol_ratio, ema_f, ema_s
+    )
+
+    return Signal(
+        symbol=symbol, direction=direction, entry_price=price,
+        stop_loss=stop, take_profit=target, regime=regime_state.primary,
+        stop_distance=stop_distance, reward_risk_ratio=reward_risk, atr=atr,
+        reason=f"MOMENTUM_BREAKOUT({'LONG' if direction == SignalDirection.LONG else 'SHORT'})",
+        strategy="MOMENTUM_BREAKOUT", atr_ratio=regime_state.atr_ratio,
+        confidence=confidence, volume_ratio=vol_ratio,
+    )
+
+
 # ---------------------------------------------------------------------------
 # OOP strategy classes — thin wrappers over the validated signal functions
 # Provides clean interface for future live hot-swap and parameter injection
@@ -688,13 +919,44 @@ class VolatilityBreakoutStrategy(BaseStrategy):
         return _volatility_breakout_signal(symbol, df, price, atr, regime_state)
 
 
+class MomentumBreakoutStrategy(BaseStrategy):
+    """Donchian channel breakout with RSI confirmation for TRENDING and RANGING regimes."""
+
+    def generate_from_cache(
+        self, symbol: str, cache: "IndicatorCache", idx: int,
+        price: float, atr: float, regime_state: RegimeState,
+    ) -> Signal:
+        return _momentum_breakout_from_cache(symbol, cache, idx, price, atr, regime_state)
+
+    def generate_live(
+        self, symbol: str, df: pd.DataFrame,
+        price: float, atr: float, regime_state: RegimeState,
+    ) -> Signal:
+        return _momentum_breakout_signal(symbol, df, price, atr, regime_state)
+
+
 class StrategyRouter:
-    """Selects and invokes the appropriate strategy based on regime."""
+    """Selects and invokes the appropriate strategy based on regime.
+
+    Routing table (priority order within each regime):
+      RANGING        → MeanReversion (primary), MomentumBreakout (secondary)
+      TRENDING       → TrendPullback (primary), MomentumBreakout (secondary)
+      HIGH_VOLATILITY→ VolatilityBreakout (if enabled), else MomentumBreakout
+    """
 
     def __init__(self) -> None:
         self._mr   = MeanReversionStrategy()
         self._tp   = TrendPullbackStrategy()
         self._vb   = VolatilityBreakoutStrategy()
+        self._mb   = MomentumBreakoutStrategy()
+
+    def _best_signal(self, a: Signal, b: Signal) -> Signal:
+        """Return the higher-confidence signal; NONE loses to any valid signal."""
+        if a.direction == SignalDirection.NONE:
+            return b
+        if b.direction == SignalDirection.NONE:
+            return a
+        return a if a.confidence >= b.confidence else b
 
     def route_from_cache(
         self, symbol: str, cache: "IndicatorCache", idx: int,
@@ -702,13 +964,49 @@ class StrategyRouter:
     ) -> Signal:
         cfg = get_config().trading
         regime = regime_state.primary
+
         if regime == Regime.RANGING:
-            return self._mr.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
-        if regime == Regime.TRENDING and not cfg.disable_trend_strategy:
-            return self._tp.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
-        if regime == Regime.HIGH_VOLATILITY and not cfg.disable_volatility_strategy:
-            return self._vb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
-        return _no_signal(symbol, price, atr, regime, "REGIME_BLOCKED", "NONE", regime_state.atr_ratio)
+            mr_sig = self._mr.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
+            if cfg.disable_momentum_strategy:
+                return mr_sig
+            mb_sig = self._mb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
+            return self._best_signal(mr_sig, mb_sig)
+
+        if regime == Regime.TRENDING:
+            primary = (
+                self._tp.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
+                if not cfg.disable_trend_strategy
+                else _no_signal(symbol, price, atr, regime, "TREND_STRATEGY_DISABLED", "NONE", regime_state.atr_ratio)
+            )
+            if cfg.disable_momentum_strategy:
+                return primary
+            mb_sig = self._mb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
+            return self._best_signal(primary, mb_sig)
+
+        if regime == Regime.HIGH_VOLATILITY:
+            if not cfg.disable_volatility_strategy:
+                return self._vb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
+            # HIGH_VOL without VB: fall back to Momentum Breakout with wider stop + confidence penalty.
+            sig = self._mb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
+            if sig.direction != SignalDirection.NONE:
+                sig.confidence *= cfg.high_vol_size_reduction  # 0.5× confidence → 0.5× size
+                # Widen stop to HV multiplier to survive 1m volatility spikes
+                hv_stop_dist = atr * cfg.atr_stop_hv_multiplier
+                if sig.direction == SignalDirection.LONG:
+                    sig.stop_loss = price - hv_stop_dist
+                    sig.take_profit = price + hv_stop_dist * sig.reward_risk_ratio
+                else:
+                    sig.stop_loss = price + hv_stop_dist
+                    sig.take_profit = price - hv_stop_dist * sig.reward_risk_ratio
+                sig.stop_distance = hv_stop_dist
+                sig.reason = f"HIGH_VOL_MB({sig.reason})"
+            return sig
+
+        # Unknown regime fallback: run MB with half confidence rather than blocking
+        sig = self._mb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
+        if sig.direction != SignalDirection.NONE:
+            sig.confidence *= cfg.high_vol_size_reduction
+        return sig
 
     def route_live(
         self, symbol: str, df: pd.DataFrame,
@@ -716,13 +1014,49 @@ class StrategyRouter:
     ) -> Signal:
         cfg = get_config().trading
         regime = regime_state.primary
+
         if regime == Regime.RANGING:
-            return self._mr.generate_live(symbol, df, price, atr, regime_state)
-        if regime == Regime.TRENDING and not cfg.disable_trend_strategy:
-            return self._tp.generate_live(symbol, df, price, atr, regime_state)
-        if regime == Regime.HIGH_VOLATILITY and not cfg.disable_volatility_strategy:
-            return self._vb.generate_live(symbol, df, price, atr, regime_state)
-        return _no_signal(symbol, price, atr, regime, "REGIME_BLOCKED", "NONE", regime_state.atr_ratio)
+            mr_sig = self._mr.generate_live(symbol, df, price, atr, regime_state)
+            if cfg.disable_momentum_strategy:
+                return mr_sig
+            mb_sig = self._mb.generate_live(symbol, df, price, atr, regime_state)
+            return self._best_signal(mr_sig, mb_sig)
+
+        if regime == Regime.TRENDING:
+            primary = (
+                self._tp.generate_live(symbol, df, price, atr, regime_state)
+                if not cfg.disable_trend_strategy
+                else _no_signal(symbol, price, atr, regime, "TREND_STRATEGY_DISABLED", "NONE", regime_state.atr_ratio)
+            )
+            if cfg.disable_momentum_strategy:
+                return primary
+            mb_sig = self._mb.generate_live(symbol, df, price, atr, regime_state)
+            return self._best_signal(primary, mb_sig)
+
+        if regime == Regime.HIGH_VOLATILITY:
+            if not cfg.disable_volatility_strategy:
+                return self._vb.generate_live(symbol, df, price, atr, regime_state)
+            # HIGH_VOL without VB: fall back to Momentum Breakout with wider stop + confidence penalty.
+            sig = self._mb.generate_live(symbol, df, price, atr, regime_state)
+            if sig.direction != SignalDirection.NONE:
+                sig.confidence *= cfg.high_vol_size_reduction  # 0.5× confidence → 0.5× size
+                # Widen stop to HV multiplier to survive 1m volatility spikes
+                hv_stop_dist = atr * cfg.atr_stop_hv_multiplier
+                if sig.direction == SignalDirection.LONG:
+                    sig.stop_loss = price - hv_stop_dist
+                    sig.take_profit = price + hv_stop_dist * sig.reward_risk_ratio
+                else:
+                    sig.stop_loss = price + hv_stop_dist
+                    sig.take_profit = price - hv_stop_dist * sig.reward_risk_ratio
+                sig.stop_distance = hv_stop_dist
+                sig.reason = f"HIGH_VOL_MB({sig.reason})"
+            return sig
+
+        # Unknown regime fallback: run MB with half confidence rather than blocking
+        sig = self._mb.generate_live(symbol, df, price, atr, regime_state)
+        if sig.direction != SignalDirection.NONE:
+            sig.confidence *= cfg.high_vol_size_reduction
+        return sig
 
 
 # Module-level singleton (instantiated once)

@@ -109,9 +109,9 @@ class TradingEngine:
         self._correlation_interval: int = 600  # seconds
 
         # Regime-block cache: symbol → unix timestamp of last REGIME_BLOCKED
-        # Prevents perpetually blocked symbols from consuming top_n slots
+        # Shorter TTL for 1m timeframe so regime re-evaluates more frequently
         self._regime_block_cache: Dict[str, float] = {}
-        self._regime_block_ttl: int = 300  # seconds — re-evaluate after 5 min
+        self._regime_block_ttl: int = 120  # 2 minutes on 1m timeframe
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -123,6 +123,23 @@ class TradingEngine:
 
         # Initial universe discovery
         self._universe.refresh()
+
+        # Live mode: configure exchange account after universe is known
+        # Sets hedge_mode + cross margin + leverage on all active symbols
+        # (mirrors passivbot's update_exchange_config — safe to call on every start)
+        if self._mode == "live":
+            try:
+                symbols = self._universe.get_universe()
+                self._rest.initialize_account(
+                    symbols=symbols,
+                    leverage=self._cfg.trading.default_leverage,
+                )
+                log.info(
+                    "Exchange initialized: hedge_mode + cross margin + %d× leverage on %d symbols",
+                    self._cfg.trading.default_leverage, len(symbols),
+                )
+            except Exception as e:
+                log.error("Account initialization failed (will retry next cycle): %s", e)
 
         log.info("Engine running. Press Ctrl+C to stop.")
 
@@ -196,6 +213,14 @@ class TradingEngine:
         scores = self._scanner.scan(universe)
         top_n = scores[:self._cfg.trading.top_n_symbols]
 
+        # Log scanner summary for top symbols
+        if scores:
+            top_strs = [
+                f"{s.symbol}(sc={s.score:.2f},rs={s.rs_btc_score:.2f})"
+                for s in top_n[:5]
+            ]
+            log.debug("Scanner top-5: %s", " | ".join(top_strs))
+
         # Generate and execute signals
         current_prices = self._get_current_prices()
         trace_enabled = self._cfg.trading.log_decision_trace
@@ -203,6 +228,9 @@ class TradingEngine:
         signals_evaluated = 0
         signals_generated = 0
         trades_placed = 0
+
+        # Reset per-cycle trade counter so burst cap applies fresh each scan
+        self._executor.reset_cycle_counter()
 
         for score in top_n:
             sym = score.symbol

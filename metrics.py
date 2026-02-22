@@ -174,15 +174,13 @@ class MetricsTracker:
             return 0.0
         cfg = get_config().trading
         arr = np.array(returns)
-        # Annualize: 96 × 15-min periods per day, 365 days
-        periods_per_year = 96 * 365
+        # Annualize based on configured candle granularity
+        periods_per_year = getattr(cfg, "candle_periods_per_day", 96) * 365
         excess = arr - (cfg.sharpe_risk_free_rate / periods_per_year)
         std = np.std(excess)
-        # Guard: floating-point near-zero std produces astronomical values
         if abs(std) < 1e-10:
             return 0.0
         raw = float(np.mean(excess) / std * np.sqrt(periods_per_year))
-        # Clamp to a sane range — prevents display/logging of ±inf
         return max(-100.0, min(100.0, raw))
 
     def _compute_max_drawdown(self, equity: List[float]) -> float:

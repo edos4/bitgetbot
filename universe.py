@@ -46,8 +46,11 @@ class UniverseManager:
         eligible: List[str] = []
         ticker_map: Dict[str, Dict] = {}
 
+        blocklist = set(getattr(self._cfg, "symbol_blocklist", []))
         for t in tickers:
             symbol = t.get("symbol", "")
+            if symbol in blocklist:
+                continue
             try:
                 vol_24h = float(t.get("quoteVolume", 0) or t.get("usdtVolume", 0) or 0)
             except ValueError:
