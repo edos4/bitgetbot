@@ -1024,6 +1024,9 @@ class StrategyRouter:
             if not cfg.disable_volatility_strategy:
                 return self._vb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
             # HIGH_VOL without VB: fall back to Momentum Breakout with wider stop + confidence penalty.
+            # If MB is also disabled, return no-signal rather than wasting compute.
+            if cfg.disable_momentum_strategy:
+                return _no_signal(symbol, price, atr, regime_state.primary, "MB_DISABLED", "NONE", regime_state.atr_ratio)
             sig = self._mb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
             if sig.direction != SignalDirection.NONE:
                 sig.confidence *= cfg.high_vol_size_reduction  # 0.5× confidence → 0.5× size
@@ -1040,6 +1043,9 @@ class StrategyRouter:
             return sig
 
         # Unknown regime fallback: run MB with half confidence rather than blocking
+        # If MB is disabled, return no-signal.
+        if cfg.disable_momentum_strategy:
+            return _no_signal(symbol, price, atr, regime_state.primary, "MB_DISABLED", "NONE", regime_state.atr_ratio)
         sig = self._mb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
         if sig.direction != SignalDirection.NONE:
             sig.confidence *= cfg.high_vol_size_reduction
@@ -1074,6 +1080,9 @@ class StrategyRouter:
             if not cfg.disable_volatility_strategy:
                 return self._vb.generate_live(symbol, df, price, atr, regime_state)
             # HIGH_VOL without VB: fall back to Momentum Breakout with wider stop + confidence penalty.
+            # If MB is also disabled, return no-signal rather than wasting compute.
+            if cfg.disable_momentum_strategy:
+                return _no_signal(symbol, price, atr, regime_state.primary, "MB_DISABLED", "NONE", regime_state.atr_ratio)
             sig = self._mb.generate_live(symbol, df, price, atr, regime_state)
             if sig.direction != SignalDirection.NONE:
                 sig.confidence *= cfg.high_vol_size_reduction  # 0.5× confidence → 0.5× size
@@ -1090,6 +1099,9 @@ class StrategyRouter:
             return sig
 
         # Unknown regime fallback: run MB with half confidence rather than blocking
+        # If MB is disabled, return no-signal.
+        if cfg.disable_momentum_strategy:
+            return _no_signal(symbol, price, atr, regime_state.primary, "MB_DISABLED", "NONE", regime_state.atr_ratio)
         sig = self._mb.generate_live(symbol, df, price, atr, regime_state)
         if sig.direction != SignalDirection.NONE:
             sig.confidence *= cfg.high_vol_size_reduction

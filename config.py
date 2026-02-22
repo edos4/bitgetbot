@@ -101,7 +101,7 @@ class TradingConfig:
     partial_exit_r: float = 1.0               # Take partial profit at 1R (one full risk unit)
     partial_exit_fraction: float = 0.50       # Close 50% at partial exit; trail remainder
     breakeven_trigger_r: float = 9999.0       # DISABLED: breakeven stop caps wins same as partial close; let positions run to target
-    stagnant_exit_bars: int = 60              # 60 × 1m bars = 1 hour stagnation limit
+    stagnant_exit_bars: int = 20              # 20 × 1m bars = 20 min stagnation limit (was 60; frees capital faster)
     stagnant_exit_r_threshold: float = 0.2   # Exit if unrealized < this many R after N bars
     candle_seconds: int = 60                  # 1m candles = 60 seconds (for time-based calc)
     # ---- Volatility Breakout ----
