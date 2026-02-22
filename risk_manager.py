@@ -138,9 +138,9 @@ class RiskManager:
                 risk_dollar = remaining_heat
                 risk_fraction = risk_dollar / (current_equity + 1e-10)
 
-            # Sanity: don't enter a position too tiny to be meaningful (< 0.1% equity)
-            if risk_fraction < 0.001:
-                return RiskDecision(False, "Scaled risk fraction too small after heat-cap adjustment (<0.1%)")
+            # Sanity: don't enter a position too tiny to be meaningful (< 0.01% equity)
+            if risk_fraction < 0.0001:
+                return RiskDecision(False, "Scaled risk fraction too small after heat-cap adjustment (<0.01%)")
 
             # 6. Per-base-asset exposure cap
             base = _base_asset(symbol)
@@ -161,8 +161,8 @@ class RiskManager:
                 risk_dollar = available
                 risk_fraction = risk_dollar / (current_equity + 1e-10)
 
-            if risk_fraction < 0.001:
-                return RiskDecision(False, "Scaled risk fraction too small after base-cap adjustment (<0.1%)")
+            if risk_fraction < 0.0001:
+                return RiskDecision(False, "Scaled risk fraction too small after base-cap adjustment (<0.01%)")
 
             # 7. Directional exposure cap: limit long and short side independently
             current_dir_risk = self._long_risk if dir_upper == "LONG" else self._short_risk
@@ -182,8 +182,8 @@ class RiskManager:
                 risk_dollar = available_dir
                 risk_fraction = risk_dollar / (current_equity + 1e-10)
 
-            if risk_fraction < 0.001:
-                return RiskDecision(False, "Scaled risk fraction too small after directional-cap adjustment (<0.1%)")
+            if risk_fraction < 0.0001:
+                return RiskDecision(False, "Scaled risk fraction too small after directional-cap adjustment (<0.01%)")
 
             heat_pct = (total_heat + risk_dollar) / (current_equity + 1e-10)
             log.info(

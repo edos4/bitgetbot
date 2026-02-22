@@ -133,10 +133,12 @@ class IndicatorCache:
         obj.high_n = df["high"].rolling(n).max().shift(1)
         obj.low_n  = df["low"].rolling(n).min().shift(1)
 
-        # Raw volume ratio (current bar / rolling mean)
+        # Raw volume ratio: last CLOSED bar / rolling mean
+        # Use shift(1) so the partial in-progress bar (iloc[-1]) doesn't
+        # produce near-zero ratios every scan.  Consistent with high_n/low_n.
         raw_vol = df["volume"]
         avg_vol = raw_vol.rolling(cfg.volume_lookback).mean()
-        obj.raw_vol_ratio = raw_vol / (avg_vol + 1e-10)
+        obj.raw_vol_ratio = raw_vol.shift(1) / (avg_vol.shift(1) + 1e-10)
 
         # RSI
         rsi_ind = ta.momentum.RSIIndicator(close=close, window=cfg.rsi_period)
@@ -697,11 +699,11 @@ def _volatility_breakout_signal(
 
 
 def _compute_vol_ratio(df: pd.DataFrame, lookback: int = 20) -> float:
-    """Return current_vol / rolling_avg_vol for live/paper path."""
-    if len(df) < lookback + 1:
+    """Return last closed bar vol / rolling_avg_vol for live/paper path."""
+    if len(df) < lookback + 2:
         return 1.0
-    avg_vol  = float(df["volume"].iloc[-(lookback + 1):-1].mean())
-    last_vol = float(df["volume"].iloc[-1])
+    avg_vol  = float(df["volume"].iloc[-(lookback + 2):-2].mean())
+    last_vol = float(df["volume"].iloc[-2])  # last CLOSED bar (not partial)
     return last_vol / (avg_vol + 1e-10)
 
 
