@@ -65,17 +65,30 @@ class ExecutionEngine:
             log.warning("❌ Trade rejected [%s]: stop_loss=%.10f ≤ 0", signal.symbol, signal.stop_loss)
             return False
 
-        # 2. ATR must be ≥ 0.1% of entry price — prevents division-by-zero and trivial sizing
+        # 2. ATR must be ≥ 0.005% of entry price — prevents division-by-zero and trivial sizing
         min_atr_abs = signal.entry_price * self._cfg.min_atr_fraction
         if signal.atr <= 0 or signal.atr < min_atr_abs:
             log.warning(
-                "❌ Trade rejected [%s]: ATR=%.10f below min (%.10f = %.3f%% of price)",
+                "\u274c Trade rejected [%s]: ATR=%.10f below min (%.10f = %.3f%% of price)",
                 signal.symbol, signal.atr, min_atr_abs, self._cfg.min_atr_fraction * 100,
             )
             return False
 
-        # 3. Stop distance must be ≥ 1.5× ATR — ensures stop is not within intrabar noise.
-        #    Price-% floor removed: 0.07% of BTC ($47) blocked valid $24 stops where ATR×1.5 was satisfied.
+        # 3a. Stop distance must be ≥ price × min_stop_fraction — prevents DOGE-class
+        #     cases where ATR is near-zero so ATR×N produces a trivially tight stop.
+        #     At 0.05% of price: BTC@$68k → min $34 stop;  DOGE@$0.097 → min $0.000049.
+        if self._cfg.min_stop_fraction > 0:
+            min_stop_price = signal.entry_price * self._cfg.min_stop_fraction
+            if signal.stop_distance < min_stop_price:
+                log.warning(
+                    "\u274c Trade rejected [%s]: stop_distance=%.8f below price floor "
+                    "(%.8f = %.3f%% of entry)",
+                    signal.symbol, signal.stop_distance,
+                    min_stop_price, self._cfg.min_stop_fraction * 100,
+                )
+                return False
+
+        # 3b. Stop distance must be ≥ 1.5× ATR — ensures stop is not within intrabar noise.
         min_stop_by_atr = signal.atr * self._cfg.min_stop_atr_multiple
         if signal.stop_distance < min_stop_by_atr:
             log.warning(

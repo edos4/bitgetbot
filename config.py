@@ -55,8 +55,8 @@ class TradingConfig:
     max_daily_loss_pct: float = 0.03           # Stop ALL trading after 3% daily drawdown
     max_consecutive_losses: int = 3            # Halve size after N consecutive losses
     max_directional_exposure_pct: float = 0.015 # Max 1.5% risk on long side / 1.5% on short side (tightened)
-    max_notional_per_trade_x: float = 2.5      # Per-trade notional ≤ equity × this
-    max_total_notional_x: float = 5.0          # Total portfolio notional ≤ equity × this
+    max_notional_per_trade_x: float = 0.30     # Per-trade notional ≤ 30% equity (was 2.5× — allowed $21k notional on $10k account)
+    max_total_notional_x: float = 1.0           # Total portfolio notional ≤ 100% equity (was 5.0×)
     correlation_threshold: float = 0.75        # Threshold for correlation-based scaling
     directional_corr_penalty_threshold: float = 0.80  # Corr above this + same direction → halve risk
 
@@ -134,7 +134,7 @@ class TradingConfig:
 
     # ---- Signal Validation Thresholds ----
     min_entry_price: float = 0.0001           # Reject sub-cent tokens (PEPE-class: float precision breaks sizing)
-    min_stop_fraction: float = 0.0            # Unused: price-% floor removed; ATR multiple is sufficient
+    min_stop_fraction: float = 0.0005          # Stop ≥ 0.05% of entry price — prevents DOGE-class tiny stops (ATR×N on sub-cent ATR = monster qty)
     min_atr_fraction: float = 0.00005         # ATR ≥ 0.005% of price; 0.01% caused borderline BTC rejections ($6.75 vs $6.79)
     min_stop_atr_multiple: float = 1.5        # Stop distance ≥ 1.5×ATR (prevents noise-level stops)
     min_order_notional_usdt: float = 5.1      # Bitget minimum order value (rejects silently below this)
