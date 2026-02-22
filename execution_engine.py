@@ -33,6 +33,7 @@ class ExecutionEngine:
         self._lock = threading.Lock()
         self._recent_trades = deque()
         self._symbol_last_trade: Dict[str, float] = {}  # symbol → epoch of last fill
+        self._symbol_cooldown_dur: Dict[str, int] = {}  # symbol → adaptive cooldown seconds
         self._trades_this_cycle: int = 0               # counter reset at start of each scan cycle
         self._stats = stats_manager or StrategyStatsManager()
         log.info("ExecutionEngine initialized in %s mode", self._mode.upper())
@@ -97,11 +98,14 @@ class ExecutionEngine:
             log.info("❌ Trade blocked [%s]: global trade frequency cap hit", signal.symbol)
             return False
 
-        # --- Per-symbol cooldown: prevent re-entry within symbol_cooldown_seconds ---
-        cooldown = self._cfg.symbol_cooldown_seconds
+        # --- Per-symbol adaptive cooldown ---
+        # STOP_LOSS  → 1 candle (60 s): allow re-entry once market has reset
+        # STAGNANT   → 2 candles (120 s): position dried up, wait longer
+        # TP/other   → 0 s: re-entry immediately allowed
+        cooldown = self._symbol_cooldown_dur.get(signal.symbol, 0)
         now = time.time()
         last = self._symbol_last_trade.get(signal.symbol, 0.0)
-        if now - last < cooldown:
+        if cooldown > 0 and now - last < cooldown:
             remaining = int(cooldown - (now - last))
             log.info("❌ Trade blocked [%s]: symbol on cooldown (%ds remaining)", signal.symbol, remaining)
             return False
@@ -180,16 +184,18 @@ class ExecutionEngine:
                 signal.symbol, signal.atr_ratio, self._cfg.atr_compression_ratio,
             )
 
-        # Same-direction decay: each additional open position in the same direction
-        # tapers the new entry's risk by same_direction_risk_decay per existing position.
-        # 0 existing same-dir → ×1.0;  1 existing → ×0.5;  2 → blocked upstream by risk_manager
+        # Same-direction decay ladder: each additional open same-dir position
+        # reduces the new entry's risk — convexity in strong trends, not a hard cap.
+        # 0 existing → ×1.00 | 1 → ×0.60 | 2 → ×0.35 | 3 → ×0.20
+        # (Upstream risk_manager blocks at max_same_direction_positions=4)
+        _SAME_DIR_DECAY = [1.00, 0.60, 0.35, 0.20]
         same_dir_count = self._risk.get_direction_count(signal.direction.value)
-        if same_dir_count >= 1:
-            decay = self._cfg.same_direction_risk_decay ** same_dir_count
-            risk_fraction *= decay
+        if 0 < same_dir_count < len(_SAME_DIR_DECAY):
+            decay_factor = _SAME_DIR_DECAY[same_dir_count]
+            risk_fraction *= decay_factor
             log.info(
                 "⚠ Same-direction decay [%s]: %d %s open → risk ×%.2f",
-                signal.symbol, same_dir_count, signal.direction.value, decay,
+                signal.symbol, same_dir_count, signal.direction.value, decay_factor,
             )
         # Only enforce once strategy has min_ev_sample closed trades.
         # EV = RR × win_rate − (1 − win_rate)
@@ -440,9 +446,16 @@ class ExecutionEngine:
             self._live_close(pos, current_price)
 
         self._portfolio.close_position(symbol, current_price, reason)
-        # Reset cooldown from close time so symbol can't re-enter immediately after a stop
-        if reason in ("STOP_LOSS", "STAGNANT"):
+        # Adaptive cooldown: duration depends on why position was closed
+        if reason == "STOP_LOSS":
             self._symbol_last_trade[symbol] = time.time()
+            self._symbol_cooldown_dur[symbol] = 60    # 1 candle
+        elif reason == "STAGNANT":
+            self._symbol_last_trade[symbol] = time.time()
+            self._symbol_cooldown_dur[symbol] = 120   # 2 candles
+        else:
+            # TP or manual close: allow immediate re-entry
+            self._symbol_cooldown_dur[symbol] = 0
         return True
 
     def _place_order(self, signal: Signal, quantity: float, leverage: int, risk_dollar: float, risk_fraction: float) -> bool:

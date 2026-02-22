@@ -36,6 +36,10 @@ class StrategyStats:
         next_equity = self._equity_curve[-1] + pnl
         self._equity_curve.append(next_equity)
 
+    # Number of pseudo-observations used for Bayesian win_rate prior (0.5).
+    # At sample=0 → win_rate=0.50; at sample=WIN_RATE_PRIOR_N → 75% weight on real data.
+    WIN_RATE_PRIOR_N: int = 30
+
     def snapshot(self) -> StrategySnapshot:
         sample = len(self._r_values)
         if sample == 0:
@@ -43,7 +47,12 @@ class StrategyStats:
 
         wins = [r for r in self._r_values if r > 0]
         losses = [r for r in self._r_values if r <= 0]
-        win_rate = len(wins) / sample if sample else 0.0
+        raw_win_rate = len(wins) / sample if sample else 0.0
+        # Bayesian blend: pull toward 0.50 prior until we have WIN_RATE_PRIOR_N trades.
+        # This prevents 1–2 early losses from making expectancy look like -1.0
+        # and avoidsa Kelly collapse before real edge is measurable.
+        prior_n = self.WIN_RATE_PRIOR_N
+        win_rate = (len(wins) + prior_n * 0.5) / (sample + prior_n)
         avg_r = sum(self._r_values) / sample if sample else 0.0
         expectancy = avg_r
         profit_factor = (sum(wins) / abs(sum(losses))) if losses and sum(losses) != 0 else float("inf")
@@ -51,14 +60,12 @@ class StrategyStats:
         max_dd = self._compute_drawdown()
         return StrategySnapshot(win_rate, avg_r, expectancy, profit_factor, sharpe, max_dd, sample)
 
-    def kelly_fraction(self, reward_risk_ratio: float, min_sample: int = 20) -> float:
+    def kelly_fraction(self, reward_risk_ratio: float, min_sample: int = 30) -> float:
         cfg = get_config().trading
         snap = self.snapshot()
-        if snap.sample_size < min_sample:
-            # Insufficient history — fall back to conservative 50% win-rate assumption
-            p = 0.50
-        else:
-            p = snap.win_rate
+        # snapshot() already Bayesian-blends win_rate toward 0.5 prior;
+        # use it directly — no separate cold-start branch needed.
+        p = snap.win_rate
         b = max(reward_risk_ratio, 0.01)
         q = 1 - p
         f_star = (b * p - q) / b

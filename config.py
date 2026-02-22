@@ -43,7 +43,7 @@ class TradingConfig:
     scan_interval_seconds: int = 30            # 30s sub-candle scanning on 1m timeframe
     max_concurrent_positions: int = 5           # Hard cap on open positions (tight to prevent clustering)
     max_new_trades_per_cycle: int = 2           # Max new entries per single scan cycle (burst protection)
-    max_same_direction_positions: int = 2       # Hard cap: max N LONG or N SHORT open simultaneously (prevents directional stacking)
+    max_same_direction_positions: int = 4       # Soft cap: up to 4 same-direction positions; decay ladder applied in execution_engine
     same_direction_risk_decay: float = 0.5      # Each additional same-direction position scales new entry risk by this factor
     atr_compression_ratio: float = 0.7          # ATR below this fraction of median = compressed market → halve position size
 
@@ -108,8 +108,8 @@ class TradingConfig:
     volume_spike_multiplier: float = 1.0      # Legacy hard threshold; volume_ratio tiers take priority
     # Tiered volume-ratio position-sizing (replaces hard volume block)
     # Lowered thresholds for 1m: micro breakouts rarely show 1.5× volume spikes
-    volume_ratio_min: float = 0.15            # Below → skip entry (extreme thin volume only)
-    volume_ratio_half: float = 0.60           # 0.15–0.60 → 50% position size
+    volume_ratio_min: float = 0.05            # Below → skip entry (only truly zero-volume bars blocked)
+    volume_ratio_half: float = 0.60           # 0.05–0.60 → 50% position size
     volume_ratio_boost: float = 1.50          # 0.60–1.50 → 100%; above → 125% (confirmed momentum)
     volume_lookback: int = 20                 # Rolling window for average volume
 
@@ -138,7 +138,7 @@ class TradingConfig:
     min_order_notional_usdt: float = 5.1      # Bitget minimum order value (rejects silently below this)
     # ---- Expected Value (EV) Filter ----
     min_ev_threshold: float = 0.0             # Reject trades where rolling EV ≤ this
-    min_ev_sample: int = 5                    # Enforce EV filter after ≥ 5 closed trades (3 was too tight on MR early samples)
+    min_ev_sample: int = 30                   # Enforce EV filter after ≥ 30 closed trades (Bayesian prior handles cold-start)
 
     # ---- Correlation Window ----
     correlation_lookback: int = 100           # Periods for rolling correlation
