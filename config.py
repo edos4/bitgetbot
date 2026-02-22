@@ -86,7 +86,7 @@ class TradingConfig:
     trend_breakout_z: float = 2.0             # (legacy breakout — not used; kept for compat)
     disable_trend_strategy: bool = True       # TREND_PULLBACK disabled: losing strategy in all 6 live sessions; largest aggregate loss source across TRENDING regime
     disable_volatility_strategy: bool = True   # VOL_BREAKOUT disabled — full BT shows PF≈1.0, Sharpe=-8 even at best params
-    disable_momentum_strategy: bool = False    # Donchian momentum breakout — active in TRENDING + RANGING
+    disable_momentum_strategy: bool = True    # DISABLED: 7.1% WR over 14 live trades — Donchian 1m breakouts are noise
     ema_pullback_zone_atr: float = 1.0        # Default zone (fallback / HIGH_VOLATILITY)
     ema_pullback_zone_atr_trending: float = 0.8  # Tighter zone in trend: only catch clean retests
     ema_pullback_zone_atr_ranging: float = 1.8   # Wider zone in range: price oscillates further from EMA
@@ -100,7 +100,7 @@ class TradingConfig:
     enable_partial_close: bool = False         # Disabled: partial close caps wins at ~0.5R; let positions run to full target
     partial_exit_r: float = 1.0               # Take partial profit at 1R (one full risk unit)
     partial_exit_fraction: float = 0.50       # Close 50% at partial exit; trail remainder
-    breakeven_trigger_r: float = 1.0          # Move stop to entry price after 1R profit
+    breakeven_trigger_r: float = 9999.0       # DISABLED: breakeven stop caps wins same as partial close; let positions run to target
     stagnant_exit_bars: int = 60              # 60 × 1m bars = 1 hour stagnation limit
     stagnant_exit_r_threshold: float = 0.2   # Exit if unrealized < this many R after N bars
     candle_seconds: int = 60                  # 1m candles = 60 seconds (for time-based calc)
@@ -145,8 +145,8 @@ class TradingConfig:
     rs_exit_drop_threshold: float = 0.40      # Close position if symbol RS drops > this from entry-time RS (momentum collapse)
     min_order_notional_usdt: float = 5.1      # Bitget minimum order value (rejects silently below this)
     # ---- Session Gate ----
-    trading_hours_start: int = 9              # No new entries before this UTC hour (active sessions 09:00–21:00 UTC)
-    trading_hours_end: int = 21               # No new entries at/after this UTC hour (overnight liquidity is poor)
+    trading_hours_start: int = 0               # 0 = no gate (test mode); set to 9 + trading_hours_end=21 for active-hour guard
+    trading_hours_end: int = 24               # 24 = no gate (test mode); covers full day
     # ---- Portfolio Heat Gate ----
     max_portfolio_heat_pct: float = 0.005     # Block new entries if open unrealized loss > 0.5% of equity
     # ---- Symbol Blacklist ----
@@ -166,8 +166,8 @@ class TradingConfig:
 
     # ---- RSI Parameters ----
     rsi_period: int = 14
-    rsi_oversold: float = 40.0               # MR long: RSI below this confirms oversold
-    rsi_overbought: float = 60.0             # MR short: RSI above this confirms overbought
+    rsi_oversold: float = 35.0               # MR long: tightened — require deeper oversold for better MR entries
+    rsi_overbought: float = 65.0             # MR short: tightened — require deeper overbought for better MR entries
     momentum_rsi_long: float = 55.0          # Momentum breakout long: RSI must exceed
     momentum_rsi_short: float = 45.0         # Momentum breakout short: RSI must be below
     # ---- Donchian / Momentum Breakout ----

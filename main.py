@@ -246,13 +246,15 @@ class TradingEngine:
         # Gates: check before allowing any new entries this cycle
         skip_new_entries = False
 
-        # Session-hours gate: no new entries outside active trading window
-        utc_hour = datetime.now(timezone.utc).hour
+        # Session-hours gate: no new entries outside active trading window (local time)
+        # trading_hours_end=24 means gate is disabled (covers full day)
+        local_hour = datetime.now().hour
         session_cfg = self._cfg.trading
-        if not (session_cfg.trading_hours_start <= utc_hour < session_cfg.trading_hours_end):
+        gate_active = session_cfg.trading_hours_end < 24
+        if gate_active and not (session_cfg.trading_hours_start <= local_hour < session_cfg.trading_hours_end):
             log.info(
-                "⏰ Session gate: UTC %02d:xx outside trading window [%02d:00–%02d:00] — skipping new entries",
-                utc_hour, session_cfg.trading_hours_start, session_cfg.trading_hours_end,
+                "⏰ Session gate: local %02d:xx outside trading window [%02d:00-%02d:00] — skipping new entries",
+                local_hour, session_cfg.trading_hours_start, session_cfg.trading_hours_end,
             )
             skip_new_entries = True
 
