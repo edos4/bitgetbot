@@ -13,7 +13,7 @@ except ImportError:
     _HAS_COLOR = False
 
 
-def setup_logger(name: str = "trading_engine", log_level: str = "INFO", log_dir: str = "logs") -> logging.Logger:
+def setup_logger(name: str = "trading_engine", log_level: str = "INFO", log_dir: str = "logs", minimal: bool = False) -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
     level = getattr(logging, log_level.upper(), logging.INFO)
 
@@ -23,11 +23,15 @@ def setup_logger(name: str = "trading_engine", log_level: str = "INFO", log_dir:
 
     logger.setLevel(level)
 
-    fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
+    if minimal:
+        fmt = "%(asctime)s | %(message)s"
+        datefmt = "%H:%M:%S"
+    else:
+        fmt = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+        datefmt = "%Y-%m-%d %H:%M:%S"
 
     # Console handler
-    if _HAS_COLOR:
+    if _HAS_COLOR and not minimal:
         color_fmt = colorlog.ColoredFormatter(
             "%(log_color)s%(asctime)s | %(levelname)-8s%(reset)s | %(name)s | %(message)s",
             datefmt=datefmt,

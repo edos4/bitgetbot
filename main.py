@@ -686,6 +686,11 @@ def main() -> None:
         help="Candle granularity for backtest mode (default: 15m)"
     )
     parser.add_argument(
+        "--minimal_logs",
+        action="store_true",
+        help="Compact log format: time only, no level or module prefix"
+    )
+    parser.add_argument(
         "--equity",
         type=float,
         default=10_000.0,
@@ -694,7 +699,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = get_config()
-    setup_logger("trading_engine", cfg.log_level, cfg.log_dir)
+    setup_logger("trading_engine", cfg.log_level, cfg.log_dir, minimal=args.minimal_logs)
 
     mode = args.mode or cfg.trading.mode
     log.info("Starting engine | mode=%s", mode)
