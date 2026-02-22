@@ -185,6 +185,14 @@ class Scanner:
             [(s.symbol, round(s.score, 3), f"rs={s.rs_btc_score:.2f}", f"atr_pct={s.atr_pct_rank:.2f}")
              for s in top],
         )
+        # Warn on extreme new-entrant symbols: rs≥0.90 AND atr_pct≥0.90 = momentum spike + volatility spike
+        # These symbols may be running catalysts; allow scanning but flag them.
+        for s in top:
+            if s.rs_btc_score >= 0.90 and s.atr_pct_rank >= 0.90:
+                log.warning(
+                    "⚠️  Extreme symbol [%s]: rs=%.2f atr_pct=%.2f — momentum/volatility spike, treat entries with caution",
+                    s.symbol, s.rs_btc_score, s.atr_pct_rank,
+                )
         return scores
 
     def get_top_n(self, n: Optional[int] = None) -> List[SymbolScore]:

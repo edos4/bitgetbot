@@ -237,6 +237,13 @@ class PortfolioManager:
         vals = [abs(v) for other, v in row.items() if other in open_syms]
         return max(vals) if vals else 0.0
 
+    def get_btc_correlation(self, symbol: str) -> float:
+        """Return the correlation coefficient between symbol and BTCUSDT.
+        Returns 1.0 (fully correlated) if unknown — conservative default preserves the gate."""
+        with self._lock:
+            row = self._correlations.get(symbol, {})
+        return abs(row.get("BTCUSDT", 1.0))
+
     # ------------------------------------------------------------------ #
     # Portfolio variance guard
     # ------------------------------------------------------------------ #

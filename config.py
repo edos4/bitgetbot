@@ -42,7 +42,7 @@ class TradingConfig:
     ])  # Expand as new problem tokens appear in logs
     scan_interval_seconds: int = 30            # 30s sub-candle scanning on 1m timeframe
     max_concurrent_positions: int = 5           # Hard cap on open positions (tight to prevent clustering)
-    max_new_trades_per_cycle: int = 2           # Max new entries per single scan cycle (burst protection)
+    max_new_trades_per_cycle: int = 3           # Max new entries per single scan cycle (raised: 2 was blocking valid signals when 2 fill simultaneously)
     max_same_direction_positions: int = 4       # Soft cap: up to 4 same-direction positions; decay ladder applied in execution_engine
     same_direction_risk_decay: float = 0.5      # Each additional same-direction position scales new entry risk by this factor
     atr_compression_ratio: float = 0.7          # ATR below this fraction of median = compressed market → halve position size
@@ -134,10 +134,11 @@ class TradingConfig:
 
     # ---- Signal Validation Thresholds ----
     min_entry_price: float = 0.0001           # Reject sub-cent tokens (PEPE-class: float precision breaks sizing)
-    min_stop_fraction: float = 0.0005          # Price-% stop floor: stop must be ≥ 0.05% of entry (catches zero-ATR degenerate stops; 0.25% was too high, 0.05% is conservative)
+    min_stop_fraction: float = 0.00015         # Price-% stop floor: 0.015% — BTC 1m ATR-based stops are $10-20 ($68k); 0.05% floor ($34) rejected BTC every cycle; 0.015% = $10.2 threshold
     min_atr_fraction: float = 0.00005         # ATR ≥ 0.005% of price; 0.01% caused borderline BTC rejections ($6.75 vs $6.79)
     min_stop_atr_multiple: float = 1.5        # Stop distance ≥ 1.5×ATR (prevents noise-level stops)
     rsi_momentum_long_min: float = 55.0       # TREND_PULLBACK LONG in TRENDING: RSI must be > this (momentum confirm)
+    btc_gate_min_correlation: float = 0.6     # BTC EMA gate only applies if symbol’s correlation to BTC ≥ this; low-corr alts are exempt
     min_order_notional_usdt: float = 5.1      # Bitget minimum order value (rejects silently below this)
     min_signal_confidence: float = 0.45       # Reject signals below this confidence; conf=0.32 is noise territory on 1m
     # ---- Expected Value (EV) Filter ----

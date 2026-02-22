@@ -300,12 +300,19 @@ class TradingEngine:
                 signal.confidence,
             )
             # BTC gate: block LONG entries on alts when BTC is in a downtrend
+            # Exemption: symbols with portfolio correlation to BTC < btc_gate_min_correlation
+            # (low-corr alts are not reliably suppressed by BTC macro direction)
             if (signal.direction == SignalDirection.LONG
                     and sym != "BTCUSDT"
                     and not btc_bullish):
-                if trace_enabled:
-                    log.info("TRACE %s: LONG blocked — BTC EMA bearish (gate)", sym)
-                continue
+                btc_corr = self._portfolio.get_btc_correlation(sym)
+                if btc_corr >= self._cfg.btc_gate_min_correlation:
+                    if trace_enabled:
+                        log.info("TRACE %s: LONG blocked — BTC EMA bearish (gate, corr=%.2f)", sym, btc_corr)
+                    continue
+                else:
+                    if trace_enabled:
+                        log.info("TRACE %s: BTC gate bypassed — low BTC corr=%.2f < %.2f", sym, btc_corr, self._cfg.btc_gate_min_correlation)
             placed = self._executor.execute_signal(signal, equity, current_prices)
             if placed:
                 trades_placed += 1
