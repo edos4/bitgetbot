@@ -134,10 +134,11 @@ class TradingConfig:
 
     # ---- Signal Validation Thresholds ----
     min_entry_price: float = 0.0001           # Reject sub-cent tokens (PEPE-class: float precision breaks sizing)
-    min_stop_fraction: float = 0.0005          # Stop ≥ 0.05% of entry price — prevents DOGE-class tiny stops (ATR×N on sub-cent ATR = monster qty)
+    min_stop_fraction: float = 0.0025          # Stop ≥ 0.25% of entry price — DOGE@$0.097 min stop=$0.000243; ATR×2 on 1m was $0.00014 (half tick = noise trade)
     min_atr_fraction: float = 0.00005         # ATR ≥ 0.005% of price; 0.01% caused borderline BTC rejections ($6.75 vs $6.79)
     min_stop_atr_multiple: float = 1.5        # Stop distance ≥ 1.5×ATR (prevents noise-level stops)
     min_order_notional_usdt: float = 5.1      # Bitget minimum order value (rejects silently below this)
+    min_signal_confidence: float = 0.45       # Reject signals below this confidence; conf=0.32 is noise territory on 1m
     # ---- Expected Value (EV) Filter ----
     min_ev_threshold: float = 0.0             # Reject trades where rolling EV ≤ this
     min_ev_sample: int = 30                   # Enforce EV filter after ≥ 30 closed trades (Bayesian prior handles cold-start)

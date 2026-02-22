@@ -106,7 +106,13 @@ class ExecutionEngine:
                 signal.symbol, self._trades_this_cycle, max_per_cycle,
             )
             return False
-
+        # Minimum signal confidence gate: weak conf = noise on 1m
+        if signal.confidence < self._cfg.min_signal_confidence:
+            log.info(
+                "\u274c Trade blocked [%s]: conf=%.2f below min=%.2f",
+                signal.symbol, signal.confidence, self._cfg.min_signal_confidence,
+            )
+            return False
         if not self._can_trade_now():
             log.info("❌ Trade blocked [%s]: global trade frequency cap hit", signal.symbol)
             return False

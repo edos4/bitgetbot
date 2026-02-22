@@ -232,6 +232,17 @@ class TradingEngine:
         # Reset per-cycle trade counter so burst cap applies fresh each scan
         self._executor.reset_cycle_counter()
 
+        # BTC regime gate: suppress alt LONG trades when BTC EMA trend is bearish.
+        # On 1m, if BTC fast EMA < slow EMA, the macro environment is adverse for longs.
+        btc_bullish = True  # default: permissive
+        btc_df = self._feed.get_ohlcv("BTCUSDT")
+        if btc_df is not None and len(btc_df) >= 50:
+            ema_fast = float(btc_df["close"].ewm(span=9, adjust=False).mean().iloc[-1])
+            ema_slow = float(btc_df["close"].ewm(span=26, adjust=False).mean().iloc[-1])
+            btc_bullish = ema_fast > ema_slow
+            if not btc_bullish:
+                log.debug("BTC gate: EMA bearish (ema9=%.1f < ema26=%.1f) — alt LONGs suppressed", ema_fast, ema_slow)
+
         for score in top_n:
             sym = score.symbol
             # Skip already open
@@ -288,7 +299,13 @@ class TradingEngine:
                 signal.strategy,
                 signal.confidence,
             )
-
+            # BTC gate: block LONG entries on alts when BTC is in a downtrend
+            if (signal.direction == SignalDirection.LONG
+                    and sym != "BTCUSDT"
+                    and not btc_bullish):
+                if trace_enabled:
+                    log.info("TRACE %s: LONG blocked — BTC EMA bearish (gate)", sym)
+                continue
             placed = self._executor.execute_signal(signal, equity, current_prices)
             if placed:
                 trades_placed += 1
@@ -298,11 +315,11 @@ class TradingEngine:
                     position_cost = pos.entry_price * pos.quantity + 1e-10
                     pnl_pct = (unrealized / position_cost) * 100
                     log.info(
-                        "🆕 Trade opened: %s %s @ %.4f | size=$%.2f | stop=%.4f | PnL $%.2f (%.2f%%)",
+                        "\U0001f195 Trade opened: %s %s @ %.4f | notional=$%.2f | stop=%.4f | PnL $%.2f (%.2f%%)",
                         signal.direction.value,
                         sym,
                         signal.entry_price,
-                        pos.quantity * pos.entry_price / pos.leverage,
+                        pos.quantity * pos.entry_price,
                         signal.stop_loss,
                         unrealized,
                         pnl_pct,
@@ -312,7 +329,7 @@ class TradingEngine:
                         direction=signal.direction.value,
                         entry=signal.entry_price,
                         stop=signal.stop_loss,
-                        size_usd=pos.quantity * pos.entry_price / pos.leverage,
+                        size_usd=pos.quantity * pos.entry_price,
                         regime=signal.regime.value,
                         pnl=unrealized,
                         pnl_pct=pnl_pct,
