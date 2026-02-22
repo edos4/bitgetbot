@@ -53,6 +53,7 @@ class MetricsTracker:
         self._trades: List[TradeRecord] = []
         self._daily_returns: List[float] = []
         self._equity_snapshots: List[float] = []
+        self._starting_balance: Optional[float] = None
 
     # ------------------------------------------------------------------ #
     # Recording
@@ -73,6 +74,8 @@ class MetricsTracker:
                 if prev > 0:
                     ret = (equity - prev) / prev
                     self._daily_returns.append(ret)
+            else:
+                self._starting_balance = equity
             self._equity_snapshots.append(equity)
 
     # ------------------------------------------------------------------ #
@@ -110,7 +113,12 @@ class MetricsTracker:
         # Expectancy
         expectancy = (win_rate * avg_win) + ((1 - win_rate) * avg_loss)
 
+        starting = self._starting_balance if self._starting_balance is not None else (equity[0] if equity else 0.0)
+        ending = equity[-1] if equity else starting
+
         stats = {
+            "starting_balance": round(starting, 2),
+            "ending_balance": round(ending, 2),
             "total_trades": len(trades),
             "win_rate": round(win_rate, 4),
             "profit_factor": round(profit_factor, 4),
