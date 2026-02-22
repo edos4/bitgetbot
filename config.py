@@ -87,7 +87,9 @@ class TradingConfig:
     disable_trend_strategy: bool = False      # EMA pullback in TRENDING regime enabled (PF=1.91 on BTC 15m)
     disable_volatility_strategy: bool = True   # VOL_BREAKOUT disabled — full BT shows PF≈1.0, Sharpe=-8 even at best params
     disable_momentum_strategy: bool = False    # Donchian momentum breakout — active in TRENDING + RANGING
-    ema_pullback_zone_atr: float = 1.0        # Wider zone for 1m: price within 1.0×ATR of EMA_fast
+    ema_pullback_zone_atr: float = 1.0        # Default zone (fallback / HIGH_VOLATILITY)
+    ema_pullback_zone_atr_trending: float = 0.8  # Tighter zone in trend: only catch clean retests
+    ema_pullback_zone_atr_ranging: float = 1.8   # Wider zone in range: price oscillates further from EMA
     atr_stop_trend_multiplier: float = 2.0    # Widened for 1m noise: 2.0 ATR stop
     atr_stop_range_multiplier: float = 1.6    # Must be > min_stop_atr_multiple(1.5); was 0.7 → all MR blocked
     atr_stop_hv_multiplier: float = 2.5       # Extra-wide stop for HIGH_VOLATILITY regime

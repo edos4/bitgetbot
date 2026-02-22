@@ -325,7 +325,12 @@ def _ema_pullback_from_cache(
         return _no_signal(symbol, price, atr, regime_state.primary, "EMA_FLAT", "TREND_PULLBACK", regime_state.atr_ratio)
 
     dist_to_fast = abs(price - ema_f)
-    zone = cfg.ema_pullback_zone_atr * atr
+    # Regime-adaptive zone: ranging markets oscillate further from EMA
+    _zone_by_regime = {
+        "TRENDING": cfg.ema_pullback_zone_atr_trending,
+        "RANGING": cfg.ema_pullback_zone_atr_ranging,
+    }
+    zone = _zone_by_regime.get(regime_state.primary.value, cfg.ema_pullback_zone_atr) * atr
     if dist_to_fast > zone:
         return _no_signal(
             symbol, price, atr, regime_state.primary,
@@ -386,7 +391,12 @@ def _ema_pullback_signal(
         return _no_signal(symbol, price, atr, regime_state.primary, "EMA_FLAT", "TREND_PULLBACK", regime_state.atr_ratio)
 
     dist_to_fast = abs(price - ema_f)
-    zone = cfg.ema_pullback_zone_atr * atr
+    # Regime-adaptive zone: ranging markets oscillate further from EMA
+    _zone_by_regime = {
+        "TRENDING": cfg.ema_pullback_zone_atr_trending,
+        "RANGING": cfg.ema_pullback_zone_atr_ranging,
+    }
+    zone = _zone_by_regime.get(regime_state.primary.value, cfg.ema_pullback_zone_atr) * atr
     if dist_to_fast > zone:
         return _no_signal(
             symbol, price, atr, regime_state.primary,
