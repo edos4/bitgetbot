@@ -243,8 +243,38 @@ class TradingEngine:
             if not btc_bullish:
                 log.debug("BTC gate: EMA bearish (ema9=%.1f < ema26=%.1f) — alt LONGs suppressed", ema_fast, ema_slow)
 
+        # Gates: check before allowing any new entries this cycle
+        skip_new_entries = False
+
+        # Session-hours gate: no new entries outside active trading window
+        utc_hour = datetime.now(timezone.utc).hour
+        session_cfg = self._cfg.trading
+        if not (session_cfg.trading_hours_start <= utc_hour < session_cfg.trading_hours_end):
+            log.info(
+                "⏰ Session gate: UTC %02d:xx outside trading window [%02d:00–%02d:00] — skipping new entries",
+                utc_hour, session_cfg.trading_hours_start, session_cfg.trading_hours_end,
+            )
+            skip_new_entries = True
+
+        # Portfolio heat gate: block new entries if open unrealized loss > threshold
+        if not skip_new_entries:
+            open_unrealized = sum(p.unrealized_pnl for p in self._portfolio.get_all_positions().values())
+            if open_unrealized < 0 and equity > 0:
+                heat_pct = abs(open_unrealized) / equity
+                if heat_pct > self._cfg.trading.max_portfolio_heat_pct:
+                    log.warning(
+                        "🔥 Portfolio heat gate: unrealized loss=$%.2f (%.2f%% equity > %.1f%% threshold) — no new entries",
+                        open_unrealized, heat_pct * 100, self._cfg.trading.max_portfolio_heat_pct * 100,
+                    )
+                    skip_new_entries = True
+
         for score in top_n:
+            if skip_new_entries:
+                break
             sym = score.symbol
+            # Skip blacklisted symbols (permanently excluded — e.g. PIPPIN: losses both sides)
+            if sym in self._cfg.trading.symbol_blacklist:
+                continue
             # Skip already open
             if self._portfolio.get_position(sym):
                 if trace_enabled:
@@ -353,15 +383,16 @@ class TradingEngine:
             log.info("Scan complete: evaluated %d symbols | signals: %d | trades placed: %d", 
                      signals_evaluated, signals_generated, trades_placed)
 
-        # Record equity snapshot
+        # Record equity snapshot (always — even if session gate fired above)
         self._metrics.record_equity(equity)
         self._last_scan_time = now
 
     def _manage_open_positions(self) -> None:
         """Manage active positions each cycle:
-        1. Partial profit take at 1R — close partial_exit_fraction of the position.
+        1. Partial profit take at 1R — disabled by default (enable_partial_close=False).
         2. Move stop to breakeven after 1R profit is locked.
         3. Time-based stagnant exit — close if < stagnant_exit_r_threshold R after N bars.
+        4. RS deterioration exit — close if RS drops > rs_exit_drop_threshold from entry.
         """
         prices = self._get_current_prices()
         cfg = self._cfg.trading
@@ -379,8 +410,8 @@ class TradingEngine:
             pos.update_price(price)
             r_current = pos.unrealized_pnl / (risk_ref + 1e-10)
 
-            # 1. Partial profit: take 50% off the table at 1R
-            if not pos.partial_taken and r_current >= cfg.partial_exit_r:
+            # 1. Partial profit: take 50% off the table at 1R (disabled by default)
+            if cfg.enable_partial_close and not pos.partial_taken and r_current >= cfg.partial_exit_r:
                 taken = self._executor.partial_close_position(
                     sym, price, fraction=cfg.partial_exit_fraction, reason="PARTIAL_1R"
                 )

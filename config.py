@@ -4,7 +4,7 @@ All tuneable parameters live here. Edit this file to customize behavior.
 """
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -97,6 +97,7 @@ class TradingConfig:
     atr_target_range_multiplier: float = 4.0  # Range take-profit: 4.0/1.6 = 2.5:1 RR
     signal_confidence_alpha: float = 0.35     # (legacy) reserved for future weighting
     # ---- Position Management ----
+    enable_partial_close: bool = False         # Disabled: partial close caps wins at ~0.5R; let positions run to full target
     partial_exit_r: float = 1.0               # Take partial profit at 1R (one full risk unit)
     partial_exit_fraction: float = 0.50       # Close 50% at partial exit; trail remainder
     breakeven_trigger_r: float = 1.0          # Move stop to entry price after 1R profit
@@ -140,9 +141,16 @@ class TradingConfig:
     rsi_momentum_long_min: float = 55.0       # TREND_PULLBACK LONG in TRENDING: RSI must be > this (momentum confirm)
     btc_gate_min_correlation: float = 0.6     # BTC EMA gate only applies if symbol’s correlation to BTC ≥ this; low-corr alts are exempt
     trend_pullback_trending_min_conf: float = 0.70  # TREND_PULLBACK in TRENDING regime requires higher confidence (4 sessions -PF; raise bar)
-    min_signal_confidence_ranging: float = 0.40     # RANGING regime uses a lower confidence floor (MEAN_REVERSION/MOMENTUM_BREAKOUT)
+    min_signal_confidence_ranging: float = 0.60     # RANGING regime: raised to 0.60 — n=31 session showed PF=0.088 at 0.40; match TRENDING bar
     rs_exit_drop_threshold: float = 0.40      # Close position if symbol RS drops > this from entry-time RS (momentum collapse)
     min_order_notional_usdt: float = 5.1      # Bitget minimum order value (rejects silently below this)
+    # ---- Session Gate ----
+    trading_hours_start: int = 9              # No new entries before this UTC hour (active sessions 09:00–21:00 UTC)
+    trading_hours_end: int = 21               # No new entries at/after this UTC hour (overnight liquidity is poor)
+    # ---- Portfolio Heat Gate ----
+    max_portfolio_heat_pct: float = 0.005     # Block new entries if open unrealized loss > 0.5% of equity
+    # ---- Symbol Blacklist ----
+    symbol_blacklist: List[str] = field(default_factory=lambda: ["PIPPINUSDT"])  # Symbols permanently excluded; PIPPIN: losses on both long+short sides across 5 sessions
     min_signal_confidence: float = 0.45       # Reject signals below this confidence; conf=0.32 is noise territory on 1m
     # ---- Expected Value (EV) Filter ----
     min_ev_threshold: float = 0.0             # Reject trades where rolling EV ≤ this
