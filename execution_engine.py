@@ -74,21 +74,9 @@ class ExecutionEngine:
             )
             return False
 
-        # 3a. Stop distance must be ≥ price × min_stop_fraction — prevents DOGE-class
-        #     cases where ATR is near-zero so ATR×N produces a trivially tight stop.
-        #     At 0.05% of price: BTC@$68k → min $34 stop;  DOGE@$0.097 → min $0.000049.
-        if self._cfg.min_stop_fraction > 0:
-            min_stop_price = signal.entry_price * self._cfg.min_stop_fraction
-            if signal.stop_distance < min_stop_price:
-                log.warning(
-                    "\u274c Trade rejected [%s]: stop_distance=%.8f below price floor "
-                    "(%.8f = %.3f%% of entry)",
-                    signal.symbol, signal.stop_distance,
-                    min_stop_price, self._cfg.min_stop_fraction * 100,
-                )
-                return False
-
         # 3b. Stop distance must be ≥ 1.5× ATR — ensures stop is not within intrabar noise.
+        #     (Price-% floor removed: min_atr_fraction already rejects near-zero ATR symbols;
+        #      a flat 0.25% floor blocked every normal 1m signal on XRP/SOL/ETH/BTC.)
         min_stop_by_atr = signal.atr * self._cfg.min_stop_atr_multiple
         if signal.stop_distance < min_stop_by_atr:
             log.warning(
