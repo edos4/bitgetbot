@@ -100,8 +100,8 @@ class TradingConfig:
     enable_partial_close: bool = False         # Disabled: partial close caps wins at ~0.5R; let positions run to full target
     partial_exit_r: float = 1.0               # Take partial profit at 1R (one full risk unit)
     partial_exit_fraction: float = 0.50       # Close 50% at partial exit; trail remainder
-    breakeven_trigger_r: float = 9999.0       # DISABLED: breakeven stop caps wins same as partial close; let positions run to target
-    stagnant_exit_bars: int = 40              # 40 × 1m bars = 40 min; was 20 — too eager, cuts positions before target
+    breakeven_trigger_r: float = 1.5          # Re-enabled: move stop to entry after 1.5R profit; protects gains without capping wins (partial close was the cap problem, not BE stop)
+    stagnant_exit_bars: int = 25              # 25 × 1m bars = 25 min; 20 was too fast, 40 held losers too long
     stagnant_exit_r_threshold: float = 0.2   # Exit if unrealized < this many R after N bars
     candle_seconds: int = 60                  # 1m candles = 60 seconds (for time-based calc)
     # ---- Volatility Breakout ----
