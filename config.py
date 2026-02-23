@@ -94,13 +94,13 @@ class TradingConfig:
     atr_stop_range_multiplier: float = 2.0    # Widened from 1.6: 1m noise eats tight stops; 2.0 gives MR room to breathe
     atr_stop_hv_multiplier: float = 2.5       # Extra-wide stop for HIGH_VOLATILITY regime
     atr_target_trend_multiplier: float = 4.0  # Trend take-profit: 4.0 stop keeps 2:1 RR
-    atr_target_range_multiplier: float = 5.0  # Range take-profit: 5.0/2.0 = 2.5:1 RR (adjusted for wider stop)
+    atr_target_range_multiplier: float = 3.0  # Reduced from 5.0: no trade reached 5.0x target in 25 bars; 3.0/2.0 = 1.5:1 RR, needs WR>40%
     signal_confidence_alpha: float = 0.35     # (legacy) reserved for future weighting
     # ---- Position Management ----
     enable_partial_close: bool = False         # Disabled: partial close caps wins at ~0.5R; let positions run to full target
     partial_exit_r: float = 1.0               # Take partial profit at 1R (one full risk unit)
     partial_exit_fraction: float = 0.50       # Close 50% at partial exit; trail remainder
-    breakeven_trigger_r: float = 1.5          # Re-enabled: move stop to entry after 1.5R profit; protects gains without capping wins (partial close was the cap problem, not BE stop)
+    breakeven_trigger_r: float = 9999.0       # DISABLED: re-enabling at 1.5R converts potential 2.5R wins into $0 BE exits; let positions run to target
     stagnant_exit_bars: int = 25              # 25 × 1m bars = 25 min; 20 was too fast, 40 held losers too long
     stagnant_exit_r_threshold: float = 0.2   # Exit if unrealized < this many R after N bars
     candle_seconds: int = 60                  # 1m candles = 60 seconds (for time-based calc)
