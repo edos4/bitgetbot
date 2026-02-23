@@ -101,7 +101,7 @@ class TradingConfig:
     partial_exit_r: float = 1.0               # Take partial profit at 1R (one full risk unit)
     partial_exit_fraction: float = 0.50       # Close 50% at partial exit; trail remainder
     breakeven_trigger_r: float = 9999.0       # DISABLED: breakeven stop caps wins same as partial close; let positions run to target
-    stagnant_exit_bars: int = 20              # 20 × 1m bars = 20 min stagnation limit (was 60; frees capital faster)
+    stagnant_exit_bars: int = 40              # 40 × 1m bars = 40 min; was 20 — too eager, cuts positions before target
     stagnant_exit_r_threshold: float = 0.2   # Exit if unrealized < this many R after N bars
     candle_seconds: int = 60                  # 1m candles = 60 seconds (for time-based calc)
     # ---- Volatility Breakout ----
@@ -141,7 +141,7 @@ class TradingConfig:
     rsi_momentum_long_min: float = 55.0       # TREND_PULLBACK LONG in TRENDING: RSI must be > this (momentum confirm)
     btc_gate_min_correlation: float = 0.6     # BTC EMA gate only applies if symbol’s correlation to BTC ≥ this; low-corr alts are exempt
     trend_pullback_trending_min_conf: float = 0.70  # TREND_PULLBACK in TRENDING regime requires higher confidence (4 sessions -PF; raise bar)
-    min_signal_confidence_ranging: float = 0.60     # RANGING regime: raised to 0.60 — n=31 session showed PF=0.088 at 0.40; match TRENDING bar
+    min_signal_confidence_ranging: float = 0.55     # RANGING: lowered 0.60→0.55; 0.60–0.65 band is best performer (PF=8); capture more of it
     rs_exit_drop_threshold: float = 0.40      # Close position if symbol RS drops > this from entry-time RS (momentum collapse)
     min_order_notional_usdt: float = 5.1      # Bitget minimum order value (rejects silently below this)
     # ---- Session Gate ----
