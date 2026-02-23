@@ -80,8 +80,8 @@ class TradingConfig:
     ema_price_buffer_pct: float = 0.001       # Allow EMA entries within 0.1% of slow EMA
     bb_touch_buffer_pct: float = 0.001        # Allow BB touches within 0.1% of the band
     log_decision_trace: bool = field(default_factory=lambda: os.getenv("LOG_DECISION_TRACE", "false").lower() == "true")
-    mean_reversion_z_entry: float = 1.1        # Hard entry threshold — validated PF=1.165 Sharpe=1.14 on BTC 15m
-    mean_reversion_z_full: float = 1.1        # Full-size threshold; below this confidence<1 shrinks position
+    mean_reversion_z_entry: float = 1.5        # Raised from 1.1: require more extreme Z for entry; 1.1 produced entries at barely-off-center bands
+    mean_reversion_z_full: float = 1.5        # Full-size threshold aligned with entry
     mean_reversion_z_exit: float = 0.25       # Exit bias when price reverts near mid band
     trend_breakout_z: float = 2.0             # (legacy breakout — not used; kept for compat)
     disable_trend_strategy: bool = True       # TREND_PULLBACK disabled: losing strategy in all 6 live sessions; largest aggregate loss source across TRENDING regime
@@ -91,10 +91,10 @@ class TradingConfig:
     ema_pullback_zone_atr_trending: float = 0.8  # Tighter zone in trend: only catch clean retests
     ema_pullback_zone_atr_ranging: float = 1.8   # Wider zone in range: price oscillates further from EMA
     atr_stop_trend_multiplier: float = 2.0    # Widened for 1m noise: 2.0 ATR stop
-    atr_stop_range_multiplier: float = 1.6    # Must be > min_stop_atr_multiple(1.5); was 0.7 → all MR blocked
+    atr_stop_range_multiplier: float = 2.0    # Widened from 1.6: 1m noise eats tight stops; 2.0 gives MR room to breathe
     atr_stop_hv_multiplier: float = 2.5       # Extra-wide stop for HIGH_VOLATILITY regime
     atr_target_trend_multiplier: float = 4.0  # Trend take-profit: 4.0 stop keeps 2:1 RR
-    atr_target_range_multiplier: float = 4.0  # Range take-profit: 4.0/1.6 = 2.5:1 RR
+    atr_target_range_multiplier: float = 5.0  # Range take-profit: 5.0/2.0 = 2.5:1 RR (adjusted for wider stop)
     signal_confidence_alpha: float = 0.35     # (legacy) reserved for future weighting
     # ---- Position Management ----
     enable_partial_close: bool = False         # Disabled: partial close caps wins at ~0.5R; let positions run to full target

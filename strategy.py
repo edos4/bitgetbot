@@ -1023,10 +1023,21 @@ class StrategyRouter:
         if regime == Regime.HIGH_VOLATILITY:
             if not cfg.disable_volatility_strategy:
                 return self._vb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
-            # HIGH_VOL without VB: fall back to Momentum Breakout with wider stop + confidence penalty.
-            # If MB is also disabled, return no-signal rather than wasting compute.
+            # HIGH_VOL: MB disabled → fall back to MR with HV-wide stops so HV symbols still generate signals.
             if cfg.disable_momentum_strategy:
-                return _no_signal(symbol, price, atr, regime_state.primary, "MB_DISABLED", "NONE", regime_state.atr_ratio)
+                sig = self._mr.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
+                if sig.direction != SignalDirection.NONE:
+                    sig.confidence *= cfg.high_vol_size_reduction  # 0.5× size penalty
+                    hv_stop_dist = atr * cfg.atr_stop_hv_multiplier
+                    if sig.direction == SignalDirection.LONG:
+                        sig.stop_loss = price - hv_stop_dist
+                        sig.take_profit = price + hv_stop_dist * sig.reward_risk_ratio
+                    else:
+                        sig.stop_loss = price + hv_stop_dist
+                        sig.take_profit = price - hv_stop_dist * sig.reward_risk_ratio
+                    sig.stop_distance = hv_stop_dist
+                    sig.reason = f"HIGH_VOL_MR({sig.reason})"
+                return sig
             sig = self._mb.generate_from_cache(symbol, cache, idx, price, atr, regime_state)
             if sig.direction != SignalDirection.NONE:
                 sig.confidence *= cfg.high_vol_size_reduction  # 0.5× confidence → 0.5× size
@@ -1079,10 +1090,21 @@ class StrategyRouter:
         if regime == Regime.HIGH_VOLATILITY:
             if not cfg.disable_volatility_strategy:
                 return self._vb.generate_live(symbol, df, price, atr, regime_state)
-            # HIGH_VOL without VB: fall back to Momentum Breakout with wider stop + confidence penalty.
-            # If MB is also disabled, return no-signal rather than wasting compute.
+            # HIGH_VOL: MB disabled → fall back to MR with HV-wide stops so HV symbols still generate signals.
             if cfg.disable_momentum_strategy:
-                return _no_signal(symbol, price, atr, regime_state.primary, "MB_DISABLED", "NONE", regime_state.atr_ratio)
+                sig = self._mr.generate_live(symbol, df, price, atr, regime_state)
+                if sig.direction != SignalDirection.NONE:
+                    sig.confidence *= cfg.high_vol_size_reduction  # 0.5× size penalty
+                    hv_stop_dist = atr * cfg.atr_stop_hv_multiplier
+                    if sig.direction == SignalDirection.LONG:
+                        sig.stop_loss = price - hv_stop_dist
+                        sig.take_profit = price + hv_stop_dist * sig.reward_risk_ratio
+                    else:
+                        sig.stop_loss = price + hv_stop_dist
+                        sig.take_profit = price - hv_stop_dist * sig.reward_risk_ratio
+                    sig.stop_distance = hv_stop_dist
+                    sig.reason = f"HIGH_VOL_MR({sig.reason})"
+                return sig
             sig = self._mb.generate_live(symbol, df, price, atr, regime_state)
             if sig.direction != SignalDirection.NONE:
                 sig.confidence *= cfg.high_vol_size_reduction  # 0.5× confidence → 0.5× size
