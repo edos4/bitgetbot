@@ -80,8 +80,8 @@ class TradingConfig:
     ema_price_buffer_pct: float = 0.001       # Allow EMA entries within 0.1% of slow EMA
     bb_touch_buffer_pct: float = 0.001        # Allow BB touches within 0.1% of the band
     log_decision_trace: bool = field(default_factory=lambda: os.getenv("LOG_DECISION_TRACE", "false").lower() == "true")
-    mean_reversion_z_entry: float = 1.5        # Raised from 1.1: require more extreme Z for entry; 1.1 produced entries at barely-off-center bands
-    mean_reversion_z_full: float = 1.5        # Full-size threshold aligned with entry
+    mean_reversion_z_entry: float = 1.2        # Lowered from 1.5: overnight market z stuck at 0.1–0.99 with 1.5 (0 trades in 1hr); 1.2 gives occasional signal
+    mean_reversion_z_full: float = 1.2        # Full-size threshold aligned with entry
     mean_reversion_z_exit: float = 0.25       # Exit bias when price reverts near mid band
     trend_breakout_z: float = 2.0             # (legacy breakout — not used; kept for compat)
     disable_trend_strategy: bool = True       # TREND_PULLBACK disabled: losing strategy in all 6 live sessions; largest aggregate loss source across TRENDING regime
